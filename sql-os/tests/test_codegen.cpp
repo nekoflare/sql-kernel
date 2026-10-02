@@ -481,6 +481,12 @@ TEST(refusals_cte_hardware) {
   CHECK_REFUSED("UPDATE memory SET value = 1 WHERE address BETWEEN 0 AND 9;",
                 "not yet compiled: UPDATE on memory supports only WHERE "
                 "address");
+  // phys rows are 8-aligned qwords: no BETWEEN form exists for them.
+  CHECK_REFUSED("SELECT value FROM phys WHERE address BETWEEN 0 AND 16;",
+                "not yet compiled: phys tables support only WHERE address");
+  CHECK_REFUSED("UPDATE phys SET value = 1 WHERE address BETWEEN 0 AND 8;",
+                "not yet compiled: UPDATE on phys supports only WHERE "
+                "address");
   CHECK_REFUSED("BEGIN;", "not yet compiled: transaction control");
 }
 
@@ -509,6 +515,19 @@ TEST(compile_crud) {
           "DELETE FROM users WHERE id = 9;"
           "SELECT id, name, age FROM users WHERE age >= 18;",
       "crud");
+}
+
+// The vm tables compile freestanding: phys goes through g_hhdm, virt_memory
+// is a bare dereference (the CPU walks the tables), cr3_write is inline asm.
+TEST(compile_vm) {
+  CHECK_COMPILES(
+      "INSERT INTO phys (address, value) VALUES (1048576, 1048579);"
+      "INSERT INTO cr3_write (value) VALUES (1048576);"
+      "INSERT INTO virt_memory (address, value) VALUES (4097, 65);"
+      "UPDATE virt_memory SET value = 66 WHERE address = 4097;"
+      "SELECT value FROM phys WHERE address = 1048576;"
+      "SELECT value FROM virt_memory WHERE address = 4097;",
+      "vm");
 }
 
 TEST(compile_recursion) {
@@ -893,6 +912,67 @@ TEST(run_page_allocator) {
 
 TEST(run_empty_program) { CHECK_RUNS("", "empty", "", ""); }
 
+// --- virtual memory, written entirely as SQL ---------------------------------
+// phys is a qword window onto RAM: SQL stores page-table entries the way it
+// stores any other word, and nothing in C++ knows what an entry means.
+// Words, not bytes: 1048579 carries flag bits above a frame number.
+TEST(run_phys_qword) {
+  CHECK_RUNS(
+      "INSERT INTO phys (address, value) VALUES (1048576, 1048579);"
+      "SELECT value FROM phys WHERE address = 1048576;"
+      "UPDATE phys SET value = 70001 WHERE address = 1048576;"
+      "SELECT value FROM phys WHERE address = 1048576;",
+      "phys_qword",
+      "1048579\n70001",
+      "");
+}
+
+// cr3_write activates a root. Hosted there is no MMU, so the driver reports
+// the load the way it reports a port write. Both INSERT forms (named column,
+// whole-row) reach the same runtime call.
+TEST(run_cr3_write) {
+  CHECK_RUNS("INSERT INTO cr3_write (value) VALUES (4096);"
+             "INSERT INTO cr3_write VALUES (8192);",
+             "cr3_write",
+             "CR3 8192 (x2)",
+             "");
+}
+
+// Five phys words build one 4 KiB mapping — PML4 -> PDPT -> PD -> PT ->
+// data frame — for virtual address 4097 (page index 1, offset 1), then
+// cr3_write points the walker at that root. The byte written through
+// virt_memory lands in byte 1 of the data frame's little-endian word, so
+// the last SELECT shows it from the physical side.
+TEST(run_virt_mapping) {
+  CHECK_RUNS(
+      "INSERT INTO phys (address, value) VALUES (1048576, 1052675);"
+      "INSERT INTO phys (address, value) VALUES (1052672, 1056771);"
+      "INSERT INTO phys (address, value) VALUES (1056768, 1060867);"
+      "INSERT INTO phys (address, value) VALUES (1060872, 1064963);"
+      "INSERT INTO cr3_write (value) VALUES (1048576);"
+      "INSERT INTO virt_memory (address, value) VALUES (4097, 65);"
+      "SELECT value FROM virt_memory WHERE address = 4097;"
+      "UPDATE virt_memory SET value = 66 WHERE address = 4097;"
+      "SELECT value FROM virt_memory WHERE address = 4097;"
+      "SELECT value FROM phys WHERE address = 1064960;",
+      "virt_mapping",
+      "65\n66\n16896\nCR3 1048576 (x1)",
+      "");
+}
+
+// Contract violations that validation cannot see trap at run time: a phys
+// address past the hosted window, and virtual addresses whose tables were
+// never built (the seeded PML4 is zeroed, so nothing is present).
+TEST(run_vm_traps) {
+  CHECK_DIES(std::string("SELECT value FROM phys WHERE address = 3145728;"),
+             "phys_range");
+  CHECK_DIES(std::string("SELECT value FROM virt_memory WHERE address = 4097;"),
+             "virt_unmapped");
+  CHECK_DIES(std::string(
+                 "INSERT INTO virt_memory (address, value) VALUES (4097, 65);"),
+             "virt_store_unmapped");
+}
+
 // Column names reach the host: each result set announces itself with an
 // "H col|col" line before its rows when the header callback is installed
 // (SQLOS_SHOW_HEADERS). Every run_* test above passes a null callback,
@@ -933,10 +1013,10 @@ TEST(run_boot_tables) {
              "H hhdm_offset|kernel_phys_base|kernel_virt_base|bootloader|"
              "bootloader_version|cmdline|firmware|framebuffer_addr|"
              "framebuffer_width|framebuffer_height|framebuffer_bpp|"
-             "module_count|boot_time\n"
+             "module_count|boot_time|cr3\n"
              "0xffff800000000000|0x100000|0xffffffff81000000|Limine|test|"
              "/vmlinuz root=/dev/sda1|x86bios|0xfd000000|1024|768|32|1|"
-             "1767225600\n"
+             "1767225600|4096\n"
              "H base|length|type\n"
              "1048576|2146435072|usable\n"
              "H base|length\n"

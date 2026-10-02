@@ -391,7 +391,9 @@ class Validator {
   void check_port(long long v);
   void check_io_value(int width, long long v);
   void check_address(long long v);
+  void check_phys_address(long long v);
   void check_byte(long long v);
+  void check_cr3_value(long long v);
 
   // --- statements -----------------------------------------------------------
   void check_statement(const sql::Statement& statement);
@@ -689,6 +691,17 @@ void Validator::check_read_contracts(const Scope& scope,
           check_address(v);
         }
       }
+    } else if (t.sys == SystemClass::Phys) {
+      if (!where_constrains(where, "address")) {
+        error(q(t.name) +
+              " reads require an address constraint (WHERE address = ...)");
+      } else {
+        for (long long v : where_const_equals(where, "address")) {
+          check_phys_address(v);
+        }
+      }
+    } else if (t.sys == SystemClass::Cr3Write) {
+      error(q(t.name) + " accepts INSERT only");
     }
   }
 }
@@ -721,6 +734,24 @@ void Validator::check_byte(long long v) {
   if (v < 0 || v > 255) {
     error("value " + std::to_string(v) +
           " is out of range 0..255 for byte-addressable memory");
+  }
+}
+
+// phys addresses name a 64-bit word: non-negative and 8-byte aligned.
+void Validator::check_phys_address(long long v) {
+  check_address(v);
+  if (v >= 0 && v % 8 != 0) {
+    error("address " + std::to_string(v) +
+          " must be a multiple of 8 for phys (qword access)");
+  }
+}
+
+// CR3 is a physical address; the low 12 bits are flag space and must be
+// clear before the register is loaded.
+void Validator::check_cr3_value(long long v) {
+  if (v < 0 || v % 4096 != 0) {
+    error("cr3 value " + std::to_string(v) +
+          " must be >= 0 and a multiple of 4096");
   }
 }
 
@@ -1456,7 +1487,8 @@ void Validator::check_returning(const std::vector<sql::SelectItem>& items,
 void Validator::check_io_and_memory_ranges_insert(
     const Table& target, const std::vector<const Column*>& eff,
     const std::vector<sql::Expr>& cells) {
-  if (target.sys != SystemClass::IoWrite && target.sys != SystemClass::Memory) {
+  if (target.sys != SystemClass::IoWrite && target.sys != SystemClass::Memory &&
+      target.sys != SystemClass::Phys && target.sys != SystemClass::Cr3Write) {
     return;
   }
   for (std::size_t i = 0; i < cells.size() && i < eff.size(); ++i) {
@@ -1469,11 +1501,18 @@ void Validator::check_io_and_memory_ranges_insert(
     } else if (ci_eq(name, "value")) {
       if (target.sys == SystemClass::IoWrite) {
         check_io_value(target.io_width, *v);
-      } else {
+      } else if (target.sys == SystemClass::Cr3Write) {
+        check_cr3_value(*v);
+      } else if (target.sys == SystemClass::Memory) {
         check_byte(*v);
       }
+      // phys: any i64 bit pattern is a legal word.
     } else if (ci_eq(name, "address")) {
-      check_address(*v);
+      if (target.sys == SystemClass::Phys) {
+        check_phys_address(*v);
+      } else {
+        check_address(*v);
+      }
     }
   }
 }
@@ -1557,7 +1596,8 @@ void Validator::check_insert(const sql::InsertStatement& s) {
         error(q(target->name) +
               " INSERT must specify both port and value");
       }
-      if (target->sys == SystemClass::Memory &&
+      if ((target->sys == SystemClass::Memory ||
+           target->sys == SystemClass::Phys) &&
           !(address_seen && value_seen)) {
         error(q(target->name) +
               " INSERT must specify both address and value");
@@ -1724,6 +1764,9 @@ void Validator::check_update(const sql::UpdateStatement& s) {
     } else if (target->sys == SystemClass::IoWrite) {
       error(q(target->name) + " accepts INSERT only");
       skip_contracts = true;
+    } else if (target->sys == SystemClass::Cr3Write) {
+      error(q(target->name) + " accepts INSERT only");
+      skip_contracts = true;
     } else if (target->sys == SystemClass::Boot) {
       error(q(target->name) + " accepts SELECT only");
       skip_contracts = true;
@@ -1751,7 +1794,8 @@ void Validator::check_update(const sql::UpdateStatement& s) {
           r.output_alias) {
         continue;
       }
-      if (r.table->sys == SystemClass::IoWrite) {
+      if (r.table->sys == SystemClass::IoWrite ||
+          r.table->sys == SystemClass::Cr3Write) {
         error(q(r.table->name) + " accepts INSERT only");
       } else if (r.table->sys == SystemClass::IoRead) {
         if (!where_constrains(s.where.get(), "port")) {
@@ -1762,13 +1806,15 @@ void Validator::check_update(const sql::UpdateStatement& s) {
             check_port(v);
           }
         }
-      } else if (r.table->sys == SystemClass::Memory) {
+      } else if (r.table->sys == SystemClass::Memory ||
+                 r.table->sys == SystemClass::Phys) {
         if (!where_constrains(s.where.get(), "address")) {
           error(q(r.table->name) +
                 " reads require an address constraint (WHERE address = ...)");
         } else {
           for (long long v : where_const_equals(s.where.get(), "address")) {
-            check_address(v);
+            if (r.table->sys == SystemClass::Phys) check_phys_address(v);
+            else check_address(v);
           }
         }
       }
@@ -1789,7 +1835,9 @@ void Validator::check_update(const sql::UpdateStatement& s) {
       if (col == nullptr) error("unknown column " + q(name));
     }
     if (assignment.second == nullptr) continue;
-    if (col != nullptr && target->sys == SystemClass::Memory &&
+    if (col != nullptr &&
+        (target->sys == SystemClass::Memory ||
+         target->sys == SystemClass::Phys) &&
         ci_eq(col->name, "address")) {
       error("cannot assign to 'address' on " + q(target->name) +
             " (only 'value' may be updated)");
@@ -1812,15 +1860,18 @@ void Validator::check_update(const sql::UpdateStatement& s) {
 
   if (s.where) expect_condition(s.where.get(), scope, "WHERE condition");
 
-  // Memory target: address constraint + constant range checks.
+  // Memory / phys target: address constraint + constant range checks.
   if (target != nullptr && !skip_contracts &&
-      target->sys == SystemClass::Memory) {
+      (target->sys == SystemClass::Memory ||
+       target->sys == SystemClass::Phys)) {
     if (!s.where || !where_constrains(s.where.get(), "address")) {
       error(q(target->name) +
             " UPDATE requires an address constraint (WHERE address = ...)");
     } else {
+      const bool phys = target->sys == SystemClass::Phys;
       for (long long v : where_const_equals(s.where.get(), "address")) {
-        check_address(v);
+        if (phys) check_phys_address(v);
+        else check_address(v);
       }
     }
   }
@@ -1852,10 +1903,12 @@ void Validator::check_delete(const sql::DeleteStatement& s) {
     } else if (target->sys == SystemClass::IoRead) {
       error(q(target->name) + " accepts SELECT only");
       skip_contracts = true;
-    } else if (target->sys == SystemClass::IoWrite) {
+    } else if (target->sys == SystemClass::IoWrite ||
+               target->sys == SystemClass::Cr3Write) {
       error(q(target->name) + " accepts INSERT only");
       skip_contracts = true;
-    } else if (target->sys == SystemClass::Memory) {
+    } else if (target->sys == SystemClass::Memory ||
+               target->sys == SystemClass::Phys) {
       error(q(target->name) + " does not support DELETE (use UPDATE instead)");
       skip_contracts = true;
     } else if (target->sys == SystemClass::Boot) {

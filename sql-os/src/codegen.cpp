@@ -274,7 +274,7 @@ class Generator {
                            "bootloader_version", "cmdline", "firmware",
                            "framebuffer_addr", "framebuffer_width",
                            "framebuffer_height", "framebuffer_bpp",
-                           "module_count", "boot_time"});
+                           "module_count", "boot_time", "cr3"});
     register_boot_storage("memory_map", "sqlos::g_memory_map",
                           {"base", "length", "type"});
   }
@@ -818,6 +818,8 @@ SelectParts Generator::plan_select(const sql::SelectStatement& s,
   std::string scan_loop;
   const Table* sys_table = nullptr;
   std::string mem_img;
+  std::string mem_addr_fn = "sqlos::mem_addr";
+  std::string mem_load;  // empty: byte image via mem_img[mem_idx(...)]
   std::string src_key;
 
   if (preset != nullptr) {
@@ -860,7 +862,7 @@ SelectParts Generator::plan_select(const sql::SelectStatement& s,
       if (t->kind == TableKind::View) {
         refuse("SELECT from view " + q(t->name));
       }
-      if (t->sys == SystemClass::IoWrite) {
+      if (t->sys == SystemClass::IoWrite || t->sys == SystemClass::Cr3Write) {
         internal(q(t->name) + " accepts INSERT only");
       }
       if (t->sys == SystemClass::IoRead) {
@@ -871,12 +873,23 @@ SelectParts Generator::plan_select(const sql::SelectStatement& s,
         b.cols.push_back({"port", ColSrc{false, "", -1, "v_port", ""}});
         b.cols.push_back({"value", ColSrc{false, "", -1, "v_value", ""}});
         sc.bindings.push_back(std::move(b));
-      } else if (t->sys == SystemClass::Memory) {
+      } else if (t->sys == SystemClass::Memory ||
+                 t->sys == SystemClass::Phys) {
         sk = Sk::Memory;
         sys_table = t;
-        mem_img = lower(t->name) == "volatile_memory"
-                      ? "sqlos::g_volatile_memory"
-                      : "sqlos::g_memory";
+        {
+          const std::string tn = lower(t->name);
+          if (tn == "phys") {
+            mem_addr_fn = "sqlos::phys_addr";
+            mem_load = "sqlos::phys_load";
+          } else if (tn == "virt_memory") {
+            mem_addr_fn = "sqlos::virt_addr";
+            mem_load = "sqlos::virt_load";
+          } else {
+            mem_img = tn == "volatile_memory" ? "sqlos::g_volatile_memory"
+                                              : "sqlos::g_memory";
+          }
+        }
         Binding b;
         b.key = src_key;
         b.cols.push_back({"address", ColSrc{false, "", -1, "v_addr", ""}});
@@ -934,25 +947,31 @@ SelectParts Generator::plan_select(const sql::SelectStatement& s,
     p.tail = "  }\n}\n";
     cond = cond_code(c.rest, sc);
   } else if (sk == Sk::Memory) {
-    const HwContract c = extract_contract(s.where.get(), "address", true);
-    if (!c.found) {
-      refuse(
-          "memory tables support only WHERE address = <expr> or address "
-          "BETWEEN low AND high");
-    }
-    if (c.value != nullptr) {
-      if (expr_has_column(*c.value)) {
-        refuse(
-            "memory tables support only WHERE address = <expr> or address "
-            "BETWEEN low AND high");
+    // phys is a qword table: its rows are the 8-aligned addresses, so a
+    // range form has no meaningful stepping — only the = form compiles.
+    const bool qword = sys_table->sys == SystemClass::Phys;
+    const HwContract c = extract_contract(s.where.get(), "address", !qword);
+    const std::string contract_msg =
+        qword ? "phys tables support only WHERE address = <expr>"
+              : std::string("memory tables support only WHERE address = "
+                            "<expr> or address BETWEEN low AND high");
+    if (!c.found) refuse(contract_msg);
+    // How one word at an address expression is read for this table.
+    const auto load_expr = [&](const std::string& av) -> std::string {
+      if (!mem_load.empty()) {
+        return "sqlos::Value::i((sqlos::i64)" + mem_load + "(" + av + "))";
       }
+      return "sqlos::Value::i((sqlos::i64)" + mem_img +
+             "[sqlos::mem_idx(" + av + ")])";
+    };
+    if (c.value != nullptr) {
+      if (expr_has_column(*c.value)) refuse(contract_msg);
       p.head += "{\n";
       p.head += "  sqlos::Value va_ = " + gen_expr(*c.value, sc) + ";\n";
       p.head += "  if (!va_.is_null()) {\n";
-      p.head += "    sqlos::i64 addr_ = sqlos::mem_addr(va_);\n";
+      p.head += "    sqlos::i64 addr_ = " + mem_addr_fn + "(va_);\n";
       p.head += "    sqlos::Value v_addr = sqlos::Value::i(addr_);\n";
-      p.head += "    sqlos::Value v_value = sqlos::Value::i((sqlos::i64)" +
-                mem_img + "[sqlos::mem_idx(addr_)]);\n";
+      p.head += "    sqlos::Value v_value = " + load_expr("addr_") + ";\n";
       p.head += "    (void)v_addr; (void)v_value;\n";  // may be unread
       p.tail = "  }\n}\n";
     } else {
@@ -960,12 +979,11 @@ SelectParts Generator::plan_select(const sql::SelectStatement& s,
       p.head += "  sqlos::Value lo_ = " + gen_expr(*c.low, sc) + ";\n";
       p.head += "  sqlos::Value hi_ = " + gen_expr(*c.high, sc) + ";\n";
       p.head += "  if (!lo_.is_null() && !hi_.is_null()) {\n";
-      p.head += "    sqlos::i64 lo2_ = sqlos::mem_addr(lo_);\n";
-      p.head += "    sqlos::i64 hi2_ = sqlos::mem_addr(hi_);\n";
+      p.head += "    sqlos::i64 lo2_ = " + mem_addr_fn + "(lo_);\n";
+      p.head += "    sqlos::i64 hi2_ = " + mem_addr_fn + "(hi_);\n";
       p.head += "    for (sqlos::i64 a_ = lo2_; a_ <= hi2_; ++a_) {\n";
       p.head += "      sqlos::Value v_addr = sqlos::Value::i(a_);\n";
-      p.head += "      sqlos::Value v_value = sqlos::Value::i((sqlos::i64)" +
-                mem_img + "[sqlos::mem_idx(a_)]);\n";
+      p.head += "      sqlos::Value v_value = " + load_expr("a_") + ";\n";
       p.head += "      (void)v_addr; (void)v_value;\n";  // may be unread
       p.tail = "    }\n  }\n}\n";
     }
@@ -1190,14 +1208,32 @@ std::string Generator::sys_row_code(const Table* t,
            cells[static_cast<std::size_t>(vi)] + ", " + std::to_string(w) +
            "));\n";
   }
+  if (t->sys == SystemClass::Cr3Write) {
+    if (vi < 0) internal(q(t->name) + " INSERT without value");
+    return "sqlos::cr3_write(sqlos::cr3_word(" +
+           cells[static_cast<std::size_t>(vi)] + "));\n";
+  }
+  if (t->sys == SystemClass::Phys) {
+    if (ai < 0 || vi < 0) {
+      internal(q(t->name) + " INSERT without address/value");
+    }
+    return "sqlos::phys_store(sqlos::phys_addr(" +
+           cells[static_cast<std::size_t>(ai)] + "), sqlos::phys_word(" +
+           cells[static_cast<std::size_t>(vi)] + "));\n";
+  }
   if (t->sys == SystemClass::Memory) {
     if (ai < 0 || vi < 0) internal(q(t->name) + " INSERT without address/value");
+    const std::string addr = cells[static_cast<std::size_t>(ai)];
+    const std::string val = cells[static_cast<std::size_t>(vi)];
+    if (lower(t->name) == "virt_memory") {
+      return "sqlos::virt_store(sqlos::virt_addr(" + addr +
+             "), sqlos::mem_byte(" + val + "));\n";
+    }
     const std::string img = lower(t->name) == "volatile_memory"
                                 ? "sqlos::g_volatile_memory"
                                 : "sqlos::g_memory";
-    return img + "[sqlos::mem_idx(sqlos::mem_addr(" +
-           cells[static_cast<std::size_t>(ai)] + "))] = sqlos::mem_byte(" +
-           cells[static_cast<std::size_t>(vi)] + ");\n";
+    return img + "[sqlos::mem_idx(sqlos::mem_addr(" + addr +
+           "))] = sqlos::mem_byte(" + val + ");\n";
   }
   internal("system row code for a user table");
 }
@@ -1255,8 +1291,10 @@ std::string Generator::gen_insert(const sql::InsertStatement& s) {
     if (t->sys == SystemClass::IoWrite && !(has_port && has_value)) {
       internal(q(t->name) + " INSERT must specify both port and value");
     }
-    if (t->sys == SystemClass::Memory && !(has_address && has_value)) {
-      internal(q(t->name) + " INSERT must specify both address and value");
+    if (t->sys == SystemClass::Memory || t->sys == SystemClass::Phys) {
+      if (!(has_address && has_value)) {
+        internal(q(t->name) + " INSERT must specify both address and value");
+      }
     }
   } else {
     const TableCG* cg = cg_for(s.table);
@@ -1365,20 +1403,34 @@ std::string Generator::gen_update(const sql::UpdateStatement& s) {
   if (t == nullptr) internal("unknown table " + q(s.table));
   if (t->kind == TableKind::View) internal("UPDATE on view " + q(s.table));
   if (t->sys == SystemClass::IoRead || t->sys == SystemClass::IoWrite ||
-      t->sys == SystemClass::Boot) {
+      t->sys == SystemClass::Cr3Write || t->sys == SystemClass::Boot) {
     internal(q(t->name) + " cannot be updated");
   }
   const std::string rel_key = lower(s.alias.empty() ? s.table : s.alias);
 
-  if (t->sys == SystemClass::Memory) {
+  if (t->sys == SystemClass::Memory || t->sys == SystemClass::Phys) {
     // Only `SET value = ... WHERE address = <expr>` compiles.
+    const bool qword = t->sys == SystemClass::Phys;
     const HwContract c = extract_contract(s.where.get(), "address", false);
     if (!c.found || c.value == nullptr || expr_has_column(*c.value)) {
-      refuse("UPDATE on memory supports only WHERE address = <expr>");
+      refuse(qword ? "UPDATE on phys supports only WHERE address = <expr>"
+                   : "UPDATE on memory supports only WHERE address = <expr>");
     }
-    const std::string img = lower(t->name) == "volatile_memory"
-                                ? "sqlos::g_volatile_memory"
-                                : "sqlos::g_memory";
+    const std::string tn = lower(t->name);
+    std::string addr_fn = "sqlos::mem_addr";
+    std::string img;
+    std::string load;
+    if (qword) {
+      addr_fn = "sqlos::phys_addr";
+      load = "sqlos::Value::i((sqlos::i64)sqlos::phys_load(addr_))";
+    } else if (tn == "virt_memory") {
+      addr_fn = "sqlos::virt_addr";
+      load = "sqlos::Value::i((sqlos::i64)sqlos::virt_load(addr_))";
+    } else {
+      img = tn == "volatile_memory" ? "sqlos::g_volatile_memory"
+                                    : "sqlos::g_memory";
+      load = "sqlos::Value::i((sqlos::i64)" + img + "[sqlos::mem_idx(addr_)])";
+    }
 
     Scope sc;
     Binding b;
@@ -1396,19 +1448,28 @@ std::string Generator::gen_update(const sql::UpdateStatement& s) {
     }
     if (set_value == nullptr) internal("memory UPDATE without SET value");
 
+    const std::string set_gen = gen_expr(*set_value, sc);
+    std::string store;
+    if (qword) {
+      store = "sqlos::phys_store(addr_, sqlos::phys_word(" + set_gen + "));";
+    } else if (tn == "virt_memory") {
+      store = "sqlos::virt_store(addr_, sqlos::mem_byte(" + set_gen + "));";
+    } else {
+      store = img + "[sqlos::mem_idx(addr_)] = sqlos::mem_byte(" + set_gen +
+              ");";
+    }
+
     std::string code;
     code += "{\n";
     code += "  sqlos::Value va_ = " + addr_expr + ";\n";
     code += "  if (!va_.is_null()) {\n";
-    code += "    sqlos::i64 addr_ = sqlos::mem_addr(va_);\n";
+    code += "    sqlos::i64 addr_ = " + addr_fn + "(va_);\n";
     code += "    sqlos::Value v_addr = sqlos::Value::i(addr_);\n";
-    code += "    sqlos::Value v_value = sqlos::Value::i((sqlos::i64)" + img +
-            "[sqlos::mem_idx(addr_)]);\n";
+    code += "    sqlos::Value v_value = " + load + ";\n";
     code += "    (void)v_addr; (void)v_value;\n";  // may be unread
     const std::string cond = cond_code(c.rest, sc);
     if (!cond.empty()) code += "    if (" + cond + ") {\n";
-    code += "    " + img + "[sqlos::mem_idx(addr_)] = sqlos::mem_byte(" +
-            gen_expr(*set_value, sc) + ");\n";
+    code += "    " + store + "\n";
     if (!cond.empty()) code += "    }\n";
     code += "  }\n";
     code += "}\n";

@@ -17,7 +17,8 @@ port `0xE9` (233), the QEMU/Bochs debug console.
 4. reports memory rows and a recursive CTE (`fib`) to the kernel's row sink
    — each result set's column names arrive first, then its rows
 5. dumps the bootloader's data as tables: `SELECT * FROM boot_info` (HHDM
-   offset, kernel bases, framebuffer, bootloader version, boot time) and
+   offset, kernel bases, framebuffer, bootloader version, boot time, and
+   `cr3` — the page-table root SQL will extend) and
    the full Limine memory map (`SELECT base, length, type FROM memory_map`)
 6. runs a page allocator written in SQL alone: claims frames 256/257 from
    the `volatile_memory` bitmap into the `pages` registry (scan cursor in
@@ -28,7 +29,9 @@ port `0xE9` (233), the QEMU/Bochs debug console.
 `kernel/src/main.cpp` — `kmain()`:
 
 * enables SSE first (see below), runs global constructors
-* fills the SQL boot tables from the Limine responses (`init_boot_tables`)
+* fills the SQL boot tables from the Limine responses (`init_boot_tables`),
+  which also installs the HHDM offset the `phys` window goes through and
+  reads `CR3` into `boot_info.cr3`
 * calls `sqlos_program(print_row, print_header, nullptr)`
 * `print_header` opens each result set (column names, then an underline of
   matching width) and closes it when the statement ends; rows are buffered
@@ -114,9 +117,9 @@ WELCOME TO SQL-OS VIA PORT E9
  21 
  34 
  55 
-    hhdm_offset      |  kernel_phys_base  |   kernel_virt_base   |  bootloader  |  bootloader_version  |  cmdline  |  firmware  |   framebuffer_addr   |  framebuffer_width  |  framebuffer_height  |  framebuffer_bpp  |  module_count  |  boot_time  
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 0xffff800000000000  |     0x7feba000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790939189 
+    hhdm_offset      |  kernel_phys_base  |   kernel_virt_base   |  bootloader  |  bootloader_version  |  cmdline  |  firmware  |   framebuffer_addr   |  framebuffer_width  |  framebuffer_height  |  framebuffer_bpp  |  module_count  |  boot_time   |     cr3     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 0xffff800000000000  |     0x7feba000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790944007  |  2146934784 
      base       |    length     |       type       
 ---------------------------------------------------
      4096       |    466944     |    bootloader    
@@ -163,7 +166,8 @@ widest entry (header name or cell), and each result set prints when its
 statement ends. `4 | 79` is the patched memory cell itself, `a` holds the
 recursive `fib` CTE, then the two boot tables arrive — `boot_info` (filled
 from the Limine responses: HHDM offset, kernel bases, bootloader
-`Limine 12.9.1`, framebuffer, boot time) and the full 20-entry memory map.
+`Limine 12.9.1`, framebuffer, boot time, and the `cr3` root) and the full
+20-entry memory map.
 Then the page-allocator result sets arrive: `pages` shows frames 256 and
 257 handed out, the `value` row is bitmap byte 32 (`3` = both bits set),
 and after `frame-a` is freed the next claim brings frame 256 back as

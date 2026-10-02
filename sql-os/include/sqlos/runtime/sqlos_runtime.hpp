@@ -206,6 +206,7 @@ struct BootInfoStore {
   Value c10[SQLOS_BOOT_INFO_ROWS];  // framebuffer_bpp (INT)
   Value c11[SQLOS_BOOT_INFO_ROWS];  // module_count (INT)
   Value c12[SQLOS_BOOT_INFO_ROWS];  // boot_time (INT, unix seconds)
+  Value c13[SQLOS_BOOT_INFO_ROWS];  // cr3 (INT, physical page-table root)
 };
 inline BootInfoStore g_boot_info = {};
 
@@ -1265,5 +1266,156 @@ inline u8 mem_byte(Value v) {
   if (n < 0 || n > 255) trap();
   return (u8)n;
 }
+
+// --- physical memory (phys) --------------------------------------------------
+// A qword window onto physical RAM: `address` is an 8-aligned byte address,
+// `value` is the little-endian 64-bit word stored there. Hosted tests
+// simulate a window big enough for the allocator's pool frames (frame 256 =
+// byte 1 MiB); the kernel dereferences real RAM through the Limine HHDM,
+// whose offset kmain() installs in g_hhdm before the program runs. Nothing
+// here knows what a page table is — SQL interprets the bits.
+
+#ifndef SQLOS_PHYS_BYTES
+#define SQLOS_PHYS_BYTES (2u << 20)       // hosted: 2 MiB (frames 0..511)
+#endif
+#ifndef SQLOS_PHYS_LIMIT
+#define SQLOS_PHYS_LIMIT 0x80000000ull    // kernel: past 2 GiB is not RAM (-m 2G)
+#endif
+
+#if defined(SQLOS_HOSTED)
+inline u8 g_phys[SQLOS_PHYS_BYTES] = {};
+#else
+inline u64 g_hhdm = 0;  // physical P lives at virtual (g_hhdm + P)
+#endif
+
+inline bool phys_range_ok(i64 a) {
+  if (a < 0 || (a & 7) != 0) return false;
+#if defined(SQLOS_HOSTED)
+  return (u64)a + 8 <= (u64)SQLOS_PHYS_BYTES;
+#else
+  return (u64)a + 8 <= (u64)SQLOS_PHYS_LIMIT;
+#endif
+}
+
+inline i64 phys_addr(Value v) {
+  if (v.is_null()) trap();
+  i64 a;
+  if (!arg_i64(v, &a)) trap();
+  if (!phys_range_ok(a)) trap();
+  return a;
+}
+
+inline u64 phys_load(i64 addr) {
+  if (!phys_range_ok(addr)) trap();
+  const u64 a = (u64)addr;
+  u64 w = 0;
+#if defined(SQLOS_HOSTED)
+  const u8* p = &g_phys[a];
+#else
+  const volatile u8* p = (const volatile u8*)(g_hhdm + a);
+#endif
+  for (int k = 0; k < 8; ++k) w |= (u64)p[k] << (k * 8);  // little-endian
+  return w;
+}
+
+inline void phys_store(i64 addr, u64 word) {
+  if (!phys_range_ok(addr)) trap();
+  const u64 a = (u64)addr;
+#if defined(SQLOS_HOSTED)
+  u8* p = &g_phys[a];
+#else
+  volatile u8* p = (volatile u8*)(g_hhdm + a);
+#endif
+  for (int k = 0; k < 8; ++k) p[k] = (u8)(word >> (k * 8));
+}
+
+// Any i64 bit pattern is a legal word: page-table entries carry flags in
+// the low bits and frame numbers above, all of which fit signed i64.
+inline u64 phys_word(Value v) {
+  if (v.is_null()) trap();
+  i64 n;
+  if (!arg_i64(v, &n)) trap();
+  return (u64)n;
+}
+
+// The INSERT value for cr3_write: a non-negative, 4096-aligned address.
+inline u64 cr3_word(Value v) {
+  if (v.is_null()) trap();
+  i64 n;
+  if (!arg_i64(v, &n)) trap();
+  if (n < 0 || (n & 4095) != 0) trap();
+  return (u64)n;
+}
+
+// --- virtual memory (virt_memory) --------------------------------------------
+// Byte access at a VIRTUAL address. In the kernel this is a plain
+// dereference: the CPU walks the page tables SQL built — no walk code
+// exists in C++. Hosted tests have no MMU, so the walker below emulates
+// one (4-level, 4 KiB pages, present/writable flags), the same role the
+// hosted inb/outb hooks play for port I/O.
+
+inline i64 virt_addr(Value v) {
+  if (v.is_null()) trap();
+  i64 a;
+  if (!arg_i64(v, &a)) trap();
+  const i64 top = a >> 47;  // arithmetic: 0 = low half, -1 = high half
+  if (top != 0 && top != -1) trap();  // non-canonical
+  return a;
+}
+
+#if defined(SQLOS_HOSTED)
+// The root the emulated walker follows. kmain's read of CR3 has no hosted
+// counterpart, so the driver seeds this with the fake boot_info.cr3.
+inline i64 g_hosted_cr3 = 4096;
+inline i64 g_hosted_cr3_write = 0;
+inline u32 g_hosted_cr3_count = 0;
+
+inline i64 hosted_virt_walk(i64 va, bool for_write) {
+  const i64 root = g_hosted_cr3;
+  if (root < 0 || (root & 4095) != 0) trap();
+  const u64 a = (u64)va;
+  u64 e = phys_load(root + (i64)(((a >> 39) & 511) * 8));  // PML4E
+  if ((e & 1) == 0) trap();
+  e = phys_load((i64)((e & 0x000ffffffffff000ull) + (((a >> 30) & 511) * 8)));
+  if ((e & 1) == 0 || (e & 0x80) != 0) trap();  // absent / 1 GiB page
+  e = phys_load((i64)((e & 0x000ffffffffff000ull) + (((a >> 21) & 511) * 8)));
+  if ((e & 1) == 0 || (e & 0x80) != 0) trap();  // absent / 2 MiB page
+  e = phys_load((i64)((e & 0x000ffffffffff000ull) + (((a >> 12) & 511) * 8)));
+  if ((e & 1) == 0) trap();                     // absent
+  if (for_write && (e & 2) == 0) trap();        // read-only page
+  return (i64)((e & 0x000ffffffffff000ull) + (a & 4095));
+}
+
+inline u8 virt_load(i64 va) {
+  const i64 a = hosted_virt_walk(va, false);
+  const u64 w = phys_load(a & ~7LL);
+  return (u8)(w >> ((a & 7) * 8));
+}
+
+inline void virt_store(i64 va, u8 v) {
+  const i64 a = hosted_virt_walk(va, true);
+  const i64 w = a & ~7LL;
+  const int sh = (int)((a & 7) * 8);
+  u64 word = phys_load(w);
+  word = (word & ~(0xffull << sh)) | ((u64)v << sh);
+  phys_store(w, word);
+}
+
+inline void cr3_write(u64 v) {
+  if ((v & 4095) != 0) trap();
+  g_hosted_cr3 = (i64)v;
+  g_hosted_cr3_write = (i64)v;
+  ++g_hosted_cr3_count;
+}
+#else
+inline u8 virt_load(i64 va) { return *(const volatile u8*)(u64)va; }
+inline void virt_store(i64 va, u8 v) { *(volatile u8*)(u64)va = v; }
+// Writing CR3 back is the flush: entries SQL adds to the live PML4 take
+// effect for the program's region, and any stale TLB slot drops.
+inline void cr3_write(u64 v) {
+  if ((v & 4095) != 0) trap();
+  __asm__ volatile("mov %0, %%cr3" : : "r"(v) : "memory");
+}
+#endif
 
 }  // namespace sqlos

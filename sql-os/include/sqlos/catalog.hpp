@@ -53,8 +53,10 @@ enum class SystemClass {
   None,     // ordinary user table (persistent store)
   IoRead,   // io_{8,16,32}_read  — SELECT only
   IoWrite,  // io_{8,16,32}_write — INSERT only
-  Memory,   // memory / volatile_memory — SELECT / INSERT / UPDATE
+  Memory,   // memory / volatile_memory / virt_memory — SELECT / INSERT / UPDATE
   Boot,     // boot_info / memory_map — SELECT only, host-filled at boot
+  Phys,     // phys — qword window onto physical RAM, SELECT / INSERT / UPDATE
+  Cr3Write  // cr3_write — INSERT only: load the page-table root (CR3)
 };
 
 enum class TableKind { Table, View };

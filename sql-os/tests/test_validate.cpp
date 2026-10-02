@@ -438,6 +438,52 @@ TEST(memory_needs_both_columns) {
                 "'memory' INSERT must specify both address and value");
 }
 
+// phys is memory's contract with qword rules: addresses must be 8-aligned
+// and any i64 bit pattern is a legal value. virt_memory is byte storage
+// behind the page tables — identical contracts to memory. cr3_write takes
+// INSERTs only, one aligned value.
+TEST(vm_table_contracts) {
+  CHECK_VALID("SELECT value FROM phys WHERE address = 1048576");
+  CHECK_VALID("INSERT INTO phys (address, value) VALUES (1048576, 1048579)");
+  CHECK_VALID("UPDATE phys SET value = 70001 WHERE address = 1048576");
+  CHECK_INVALID("SELECT value FROM phys",
+                "'phys' reads require an address constraint");
+  CHECK_INVALID("INSERT INTO phys (address, value) VALUES (4, 1)",
+                "address 4 must be a multiple of 8 for phys (qword access)");
+  CHECK_INVALID("SELECT value FROM phys WHERE address = 4",
+                "address 4 must be a multiple of 8 for phys (qword access)");
+  CHECK_INVALID("INSERT INTO phys (address, value) VALUES (-8, 1)",
+                "address must be >= 0 (got -8)");
+  CHECK_INVALID("INSERT INTO phys (value) VALUES (1)",
+                "'phys' INSERT must specify both address and value");
+  CHECK_INVALID("UPDATE phys SET value = 1",
+                "'phys' UPDATE requires an address constraint");
+  CHECK_INVALID("UPDATE phys SET address = 1 WHERE address = 0",
+                "only 'value' may be updated");
+  CHECK_INVALID("DELETE FROM phys WHERE address = 8",
+                "'phys' does not support DELETE");
+
+  CHECK_VALID("SELECT value FROM virt_memory WHERE address = 4096");
+  CHECK_VALID("INSERT INTO virt_memory (address, value) VALUES (4096, 65)");
+  CHECK_VALID("UPDATE virt_memory SET value = 7 WHERE address = 4096");
+  CHECK_INVALID("SELECT value FROM virt_memory",
+                "'virt_memory' reads require an address constraint");
+  CHECK_INVALID("INSERT INTO virt_memory (address, value) VALUES (4096, 300)",
+                "value 300 is out of range 0..255 for byte-addressable memory");
+
+  CHECK_VALID("INSERT INTO cr3_write (value) VALUES (4096)");
+  CHECK_VALID("INSERT INTO cr3_write VALUES (8192)");
+  CHECK_INVALID("SELECT value FROM cr3_write",
+                "'cr3_write' accepts INSERT only");
+  CHECK_INVALID("UPDATE cr3_write SET value = 0 WHERE value = 1",
+                "'cr3_write' accepts INSERT only");
+  CHECK_INVALID("DELETE FROM cr3_write", "'cr3_write' accepts INSERT only");
+  CHECK_INVALID("INSERT INTO cr3_write (value) VALUES (100)",
+                "cr3 value 100 must be >= 0 and a multiple of 4096");
+  CHECK_INVALID("INSERT INTO cr3_write (value) VALUES (-4096)",
+                "cr3 value -4096 must be >= 0 and a multiple of 4096");
+}
+
 TEST(system_ddl_protected) {
   CHECK_INVALID("DROP TABLE memory", "system table 'memory' cannot be dropped");
   CHECK_INVALID("DROP TABLE volatile_memory, io_8_read",

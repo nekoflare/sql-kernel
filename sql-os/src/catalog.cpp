@@ -49,6 +49,35 @@ Table make_memory_table(const std::string& name) {
   return table;
 }
 
+// The qword window onto physical RAM: `address` is an 8-aligned byte
+// address, `value` is the little-endian 64-bit word stored there. The
+// page tables this table exposes live in the frames the SQL allocator
+// hands out, so SQL can read and write entries without any C++ knowing
+// what a page table is.
+Table make_phys_table() {
+  Table table;
+  table.name = "phys";
+  table.sys = SystemClass::Phys;
+  table.columns.push_back({"address", Type::Int});
+  table.columns.push_back({"value", Type::Int});
+  return table;
+}
+
+// The data path *through* a mapping: `address` is a virtual address and
+// the hardware page tables translate it. Byte-addressable, same shape as
+// `memory`, but the backing is whatever the page tables say.
+Table make_virt_memory_table() { return make_memory_table("virt_memory"); }
+
+// Load the page-table root: INSERT only, one value column, the CR3
+// physical address (4096-aligned).
+Table make_cr3_write_table() {
+  Table table;
+  table.name = "cr3_write";
+  table.sys = SystemClass::Cr3Write;
+  table.columns.push_back({"value", Type::Int});
+  return table;
+}
+
 // The boot environment as SQL sees it: one row per Limine memory-map
 // entry. Address columns are TEXT hex — upper-half HHDM/kernel addresses
 // do not fit SQL's signed integers — while lengths stay INT so they
@@ -82,6 +111,7 @@ Table make_boot_info_table() {
   table.columns.push_back({"framebuffer_bpp", Type::Int});
   table.columns.push_back({"module_count", Type::Int});
   table.columns.push_back({"boot_time", Type::Int});
+  table.columns.push_back({"cr3", Type::Int});  // page-table root, physical
   return table;
 }
 
@@ -203,8 +233,14 @@ Catalog::Catalog() {
   }
   const Table memory = make_memory_table("memory");
   const Table volatile_memory = make_memory_table("volatile_memory");
+  const Table virt_memory = make_virt_memory_table();
+  const Table phys = make_phys_table();
+  const Table cr3_write = make_cr3_write_table();
   tables_.emplace(key(memory.name), memory);
   tables_.emplace(key(volatile_memory.name), volatile_memory);
+  tables_.emplace(key(virt_memory.name), virt_memory);
+  tables_.emplace(key(phys.name), phys);
+  tables_.emplace(key(cr3_write.name), cr3_write);
   const Table memory_map = make_memory_map_table();
   const Table boot_info = make_boot_info_table();
   tables_.emplace(key(memory_map.name), memory_map);

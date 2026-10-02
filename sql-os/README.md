@@ -91,7 +91,7 @@ The test binary can also be run directly:
 
 ```sh
 ./build/sqlos_tests
-# OK: 117 tests, 245 checks
+# OK: 123 tests, 277 checks
 ```
 
 ## CLI
@@ -136,14 +136,19 @@ each); these tables are backed by hardware or by fixed memory images:
 | `io_8_write` / `io_16_write` / `io_32_write` | `port INT, value INT` | `INSERT` only | constant `port` in `0..65535`, constant `value` in the width's range (`0..255` / `0..65535` / `0..4294967295`) |
 | `memory` | `address INT, value INT` | `SELECT` / `INSERT` / `UPDATE` | `SELECT`/`UPDATE` need `WHERE address = <expr>` or `address BETWEEN low AND high` (no `DELETE` — use `UPDATE`); literal addresses `>= 0`, literal values `0..255` |
 | `volatile_memory` | same as `memory` | same | same, separate 64 KiB image |
+| `virt_memory` | same as `memory` | same | same contracts, but the bytes sit *behind the page tables*: `address` is a virtual address translated by the tables SQL built through `phys` — a non-present page or read-only write traps. The kernel's access is a bare dereference (the CPU walks the tables; no walk code exists in C++); hosted tests emulate the walk |
+| `phys` | `address INT, value INT` | `SELECT` / `INSERT` / `UPDATE` | qword window onto physical RAM: `address` is an 8-aligned byte address, `value` the 64-bit little-endian word there (any `INT` — page-table entries carry flags and frame numbers). `SELECT`/`UPDATE` need `WHERE address = <expr>` (no `BETWEEN` — rows are words, a range has no stepping); literal addresses `>= 0` and multiples of 8. Kernel reaches RAM through the HHDM; hosted simulates a 2 MiB window |
+| `cr3_write` | `value INT` | `INSERT` only | loads the page-table root and flushes the TLB; constant `value` `>= 0` and a multiple of 4096 (so are computed values, trapped otherwise). Hosted records the load for the tests the way port writes are recorded |
 | `memory_map` | `base INT, length INT, type TEXT` | `SELECT` only | none — a full scan of the host-filled boot memory map (one row per region; `type` is `usable` / `reserved` / `acpi_reclaimable` / `acpi_nvs` / `bad` / `bootloader` / `kernel` / `framebuffer` / `reserved_mapped`) |
-| `boot_info` | `hhdm_offset, kernel_phys_base, kernel_virt_base, bootloader, bootloader_version, cmdline, firmware, framebuffer_addr` (all `TEXT`), `framebuffer_width, framebuffer_height, framebuffer_bpp, module_count, boot_time` (`INT`) | `SELECT` only | none — one row filled by the host at boot. Address columns are `0x`-hex text because upper-half HHDM/kernel addresses don't fit SQL's signed integers; a missing response arrives as `NULL` |
+| `boot_info` | `hhdm_offset, kernel_phys_base, kernel_virt_base, bootloader, bootloader_version, cmdline, firmware, framebuffer_addr` (all `TEXT`), `framebuffer_width, framebuffer_height, framebuffer_bpp, module_count, boot_time, cr3` (`INT`) | `SELECT` only | none — one row filled by the host at boot. Address columns are `0x`-hex text because upper-half HHDM/kernel addresses don't fit SQL's signed integers; a missing response arrives as `NULL` (`cr3` is the page-table root the program starts from) |
 
 Additional rules, enforced by the validator (they are errors, not
-refusals): `io_*_read` is `SELECT`-only, `io_*_write` is `INSERT`-only,
+refusals): `io_*_read` is `SELECT`-only, `io_*_write` and `cr3_write` are
+`INSERT`-only,
 `boot_info`/`memory_map` are `SELECT`-only,
 `RETURNING` / `ON CONFLICT` / `INSERT OR ...` are rejected on system
-tables, and `UPDATE memory ... SET address = ...` is rejected.
+tables, and `UPDATE memory ... SET address = ...` (likewise
+`volatile_memory` and `virt_memory`) is rejected.
 
 Range failures that survive validation as runtime values (e.g. a computed
 port) are trapped by the generated program rather than silently wrapped:
@@ -210,6 +215,8 @@ not yet compiled: DEFAULT
 not yet compiled: transaction control
 not yet compiled: io read tables support only WHERE port = <expr>
 not yet compiled: memory tables support only WHERE address = <expr> or address BETWEEN low AND high
+not yet compiled: phys tables support only WHERE address = <expr>
+not yet compiled: UPDATE on phys supports only WHERE address = <expr>
 ...
 ```
 
@@ -316,8 +323,12 @@ See `../limine-e9/README.md` for details.
    I/O (8/16/32-bit ports, both memory images), expressions, `ALTER`
    chains, star forms, simultaneous `UPDATE` assignment, deletion
    compaction, CTAS and `INSERT ... SELECT`, scalar subqueries (value,
-   NULL, CTE visibility, multi-row `trap()` via `CHECK_DIES`), and the
-   pure-SQL page allocator round trip (claim, free, reuse, exhaustion).
+   NULL, CTE visibility, multi-row `trap()` via `CHECK_DIES`), the
+   pure-SQL page allocator round trip (claim, free, reuse, exhaustion),
+   and virtual memory (qword `phys` writes, `cr3_write` activation, one
+   4-level mapping built from raw `phys` words and then read, written and
+   read back through `virt_memory`, with unmapped/out-of-window accesses
+   `trap()`-covered via `CHECK_DIES`).
 
 `tests/test_validate.cpp` covers the validator (catalog, contracts, types,
 recursive-CTE structure, issue positions).
@@ -347,7 +358,7 @@ sql-os/
 
 ## Status
 
-Validator and codegen v1 are complete and tested (117 tests, 245 checks),
+Validator and codegen v1 are complete and tested (123 tests, 277 checks),
 and the whole pipeline boots: `../limine-e9/` compiles an SQL program into
 a Limine kernel that writes port 0xE9 on real (emulated) hardware — boot
 tables and the pure-SQL page allocator included. Next steps on the

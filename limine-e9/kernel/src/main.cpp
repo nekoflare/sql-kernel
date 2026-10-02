@@ -410,6 +410,8 @@ void init_boot_tables() {
     b.count = 1;
     if (hhdm_request.response != nullptr) {
         b.c0[0] = hex_cell(g_hex_hhdm, hhdm_request.response->offset);
+        // phys reaches RAM through the HHDM: physical P lives at (g_hhdm + P).
+        sqlos::g_hhdm = hhdm_request.response->offset;
     }
     if (executable_address_request.response != nullptr) {
         b.c1[0] = hex_cell(g_hex_phys,
@@ -449,6 +451,13 @@ void init_boot_tables() {
     if (date_at_boot_request.response != nullptr) {
         b.c12[0] = sqlos::Value::i(
             static_cast<sqlos::i64>(date_at_boot_request.response->timestamp));
+    }
+    // The page-table root the program starts from: SQL extends this live
+    // PML4 in phys and reloads it through cr3_write.
+    {
+        sqlos::u64 cr3 = 0;
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        b.c13[0] = sqlos::Value::i(static_cast<sqlos::i64>(cr3 & ~4095ull));
     }
 }
 

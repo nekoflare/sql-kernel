@@ -86,6 +86,8 @@ void fill_boot_tables() {
   info.c10[0] = Value::i(32);
   info.c11[0] = Value::i(1);
   info.c12[0] = Value::i(1767225600);
+  info.c13[0] = Value::i(4096);  // fake CR3: a zeroed "PML4" at byte 4096
+  sqlos::g_hosted_cr3 = 4096;   // the emulated walker's root
 }
 
 }  // namespace
@@ -102,6 +104,11 @@ int main() {
                 static_cast<unsigned>(sqlos::g_hosted_out_port),
                 static_cast<unsigned long long>(sqlos::g_hosted_out_value),
                 static_cast<unsigned>(sqlos::g_hosted_out_count));
+  }
+  if (sqlos::g_hosted_cr3_count > 0) {
+    std::printf("CR3 %lld (x%u)\n",
+                static_cast<long long>(sqlos::g_hosted_cr3_write),
+                static_cast<unsigned>(sqlos::g_hosted_cr3_count));
   }
   return 0;
 }
