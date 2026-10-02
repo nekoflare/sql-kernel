@@ -54,6 +54,7 @@ enum class SystemClass {
   IoRead,   // io_{8,16,32}_read  — SELECT only
   IoWrite,  // io_{8,16,32}_write — INSERT only
   Memory,   // memory / volatile_memory — SELECT / INSERT / UPDATE
+  Boot,     // boot_info / memory_map — SELECT only, host-filled at boot
 };
 
 enum class TableKind { Table, View };

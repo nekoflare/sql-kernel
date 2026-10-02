@@ -4,7 +4,8 @@
 // callback is installed too and each result set announces itself as a
 // "H col|col" line before its rows. Port reads are preset from
 // SQLOS_IN_VALUE (decimal or 0x-prefixed); recorded port writes are
-// reported as a final "OUT <port>=<value> (x<count>)" line.
+// reported as a final "OUT <port>=<value> (x<count>)" line. The boot
+// tables are filled with a small fake boot environment (see below).
 
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,7 @@ void on_row(void*, const sqlos::Row* row) {
 }
 
 void on_header(void*, const char* const* cols, sqlos::u32 ncols) {
+  if (ncols == 0) return;  // end-of-result-set signal, not a header
   std::fputs("H ", stdout);
   for (sqlos::u32 i = 0; i < ncols; ++i) {
     if (i) std::fputc('|', stdout);
@@ -53,12 +55,46 @@ void on_header(void*, const char* const* cols, sqlos::u32 ncols) {
   std::fputc('\n', stdout);
 }
 
+// A small fake boot environment for the boot tables (boot_info,
+// memory_map): they read like kernel-filled data, and only boot tests
+// select from them.
+void fill_boot_tables() {
+  using sqlos::Value;
+  sqlos::MemoryMapStore& map = sqlos::g_memory_map;
+  map.count = 3;
+  map.c0[0] = Value::i(0);
+  map.c1[0] = Value::i(1048576);
+  map.c2[0] = Value::t("reserved", 8);
+  map.c0[1] = Value::i(1048576);
+  map.c1[1] = Value::i(2146435072);
+  map.c2[1] = Value::t("usable", 6);
+  map.c0[2] = Value::i(4244434944);
+  map.c1[2] = Value::i(16777216);
+  map.c2[2] = Value::t("framebuffer", 11);
+  sqlos::BootInfoStore& info = sqlos::g_boot_info;
+  info.count = 1;
+  info.c0[0] = Value::t("0xffff800000000000", 18);
+  info.c1[0] = Value::t("0x100000", 8);
+  info.c2[0] = Value::t("0xffffffff81000000", 18);
+  info.c3[0] = Value::t("Limine", 6);
+  info.c4[0] = Value::t("test", 4);
+  info.c5[0] = Value::t("/vmlinuz root=/dev/sda1", 23);
+  info.c6[0] = Value::t("x86bios", 7);
+  info.c7[0] = Value::t("0xfd000000", 10);
+  info.c8[0] = Value::i(1024);
+  info.c9[0] = Value::i(768);
+  info.c10[0] = Value::i(32);
+  info.c11[0] = Value::i(1);
+  info.c12[0] = Value::i(1767225600);
+}
+
 }  // namespace
 
 int main() {
   if (const char* in = std::getenv("SQLOS_IN_VALUE")) {
     sqlos::g_hosted_in_value = std::strtoull(in, nullptr, 0);
   }
+  fill_boot_tables();
   const bool show_headers = std::getenv("SQLOS_SHOW_HEADERS") != nullptr;
   sqlos_program(&on_row, show_headers ? &on_header : nullptr, nullptr);
   if (sqlos::g_hosted_out_count > 0) {

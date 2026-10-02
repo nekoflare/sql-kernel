@@ -1504,6 +1504,9 @@ void Validator::check_insert(const sql::InsertStatement& s) {
     } else if (target->sys == SystemClass::IoRead) {
       error(q(target->name) + " accepts SELECT only");
       target = nullptr;
+    } else if (target->sys == SystemClass::Boot) {
+      error(q(target->name) + " accepts SELECT only");
+      target = nullptr;
     }
   }
   if (target != nullptr && target->sys != SystemClass::None) {
@@ -1721,6 +1724,9 @@ void Validator::check_update(const sql::UpdateStatement& s) {
     } else if (target->sys == SystemClass::IoWrite) {
       error(q(target->name) + " accepts INSERT only");
       skip_contracts = true;
+    } else if (target->sys == SystemClass::Boot) {
+      error(q(target->name) + " accepts SELECT only");
+      skip_contracts = true;
     }
     if (target->sys != SystemClass::None && !s.returning.empty()) {
       error("RETURNING is not supported on system tables");
@@ -1851,6 +1857,9 @@ void Validator::check_delete(const sql::DeleteStatement& s) {
       skip_contracts = true;
     } else if (target->sys == SystemClass::Memory) {
       error(q(target->name) + " does not support DELETE (use UPDATE instead)");
+      skip_contracts = true;
+    } else if (target->sys == SystemClass::Boot) {
+      error(q(target->name) + " accepts SELECT only");
       skip_contracts = true;
     }
     if (target->sys != SystemClass::None && !s.returning.empty()) {

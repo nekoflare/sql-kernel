@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -293,6 +294,62 @@ void check_runs(const char* file, int line, const std::string& src,
                false);                                                         \
   } while (0)
 
+// Full path expecting a trap: the hosted binary must die on SIGILL
+// (sqlos::trap() -> __builtin_trap()) — the standard SQL error for a
+// multi-row scalar subquery, taken through the project's defined-failure
+// channel. A clean exit or any other death is a failure.
+void check_dies(const char* file, int line, const std::string& src,
+                const std::string& name) {
+  const EmitOutcome o_ = emit_program(src);
+  if (!o_.validated) {
+    report_validation_failure(file, line, src, o_);
+    return;
+  }
+  if (!o_.generated) {
+    ::testing::report_failure(file, line,
+                              std::string("unexpected refusal: ") + o_.message +
+                                  "\n  in: " + src);
+    return;
+  }
+  const std::string gen_ = temp_dir() + "/" + name + ".gen.cpp";
+  if (!write_file(gen_, o_.code)) {
+    ::testing::report_failure(file, line, "cannot write " + gen_);
+    return;
+  }
+  const std::string log_ = build_hosted(gen_, name);
+  if (!log_.empty()) {
+    ::testing::report_failure(file, line,
+                              std::string("hosted compile failed for " ) +
+                                  name + ":\n" + log_);
+    return;
+  }
+  const std::string prog = temp_dir() + "/" + name + ".prog";
+  const std::string out = temp_dir() + "/" + name + ".out";
+  const int status = std::system(
+      ("{ " + shell_quote(prog) + " > " + shell_quote(out) +
+       "; } 2>&1")
+          .c_str());
+  if (status == 0) {
+    ::testing::report_failure(file, line,
+                              "expected trap, but " + name +
+                                  " exited 0\n  in: " + src);
+  } else if ((status & 0x7f) != SIGILL &&
+             (status >> 8) != 128 + SIGILL) {
+    // system() goes through a shell: a SIGILL death arrives either raw or
+    // translated to exit code 128 + signal.
+    ::testing::report_failure(
+        file, line,
+        "expected SIGILL from trap() in " + name + ", got wait status " +
+            std::to_string(status) + "\n  in: " + src);
+  }
+}
+
+#define CHECK_DIES(src, name)                                                  \
+  do {                                                                         \
+    ++::testing::check_count();                                                \
+    check_dies(__FILE__, __LINE__, (src), (name));                             \
+  } while (0)
+
 // ---------------------------------------------------------------------------
 // Generation structure
 // ---------------------------------------------------------------------------
@@ -346,9 +403,6 @@ TEST(refusals_select) {
 }
 
 TEST(refusals_expression) {
-  CHECK_REFUSED(std::string(kSchema) +
-                    "SELECT (SELECT id FROM users) FROM users;",
-                "not yet compiled: subquery in expression");
   CHECK_REFUSED(std::string(kSchema) +
                     "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders);",
                 "not yet compiled: EXISTS");
@@ -463,6 +517,23 @@ TEST(compile_recursion) {
       "  SELECT 1 UNION ALL SELECT n + 1 FROM walk WHERE n < 100"
       ") SELECT n FROM walk WHERE n >= 98;",
       "recursion");
+}
+
+TEST(compile_scalar_subquery) {
+  // The inline IIFE sink must be warning-free under freestanding -Werror.
+  CHECK_COMPILES(
+      std::string(kSchema) +
+          "INSERT INTO users (id) VALUES (1), (2);"
+          "SELECT (SELECT id FROM users);",
+      "scalar_subquery");
+  // Refusals that live behind the subquery still hold on the new path.
+  CHECK_REFUSED(std::string(kSchema) +
+                    "SELECT (SELECT users.id FROM users, orders);",
+                "not yet compiled: multiple FROM items (joins)");
+  CHECK_REFUSED(
+      std::string(kSchema) +
+          "SELECT id FROM users WHERE id = ANY (SELECT id FROM orders);",
+      "not yet compiled: quantified comparison");
 }
 
 TEST(compile_hardware) {
@@ -706,6 +777,45 @@ TEST(run_values_statement) {
   CHECK_RUNS("VALUES (1, 'a'), (2, 'bb');", "values", "1|a\n2|bb", "");
 }
 
+TEST(run_scalar_subquery) {
+  // One row: the value itself, in a select list with an outer FROM.
+  CHECK_RUNS(std::string(kSchema) +
+                 "INSERT INTO users (id, name) VALUES (1, 'ada'), (2, 'bob');"
+                 "SELECT (SELECT name FROM users WHERE id = 1) FROM users;",
+             "sq_select_list", "ada\nada", "");
+  // No rows: NULL (standard scalar-subquery semantics).
+  CHECK_RUNS(std::string(kSchema) +
+                 "SELECT (SELECT name FROM users WHERE id = 99);",
+             "sq_empty", "NULL", "");
+  // No FROM at all: a bare scalar.
+  CHECK_RUNS(std::string(kSchema) + "SELECT (SELECT 42);", "sq_bare", "42", "");
+  // Driving a WHERE predicate.
+  CHECK_RUNS(std::string(kSchema) +
+                 "INSERT INTO users (id, name) VALUES (1, 'ada'), (2, 'bob');"
+                 "SELECT name FROM users WHERE id = "
+                 "(SELECT id FROM users WHERE name = 'bob');",
+             "sq_where", "bob", "");
+  // Feeding an UPDATE.
+  CHECK_RUNS(std::string(kSchema) +
+                 "INSERT INTO users (id, name) VALUES (1, 'ada');"
+                 "UPDATE users SET age = (SELECT id FROM users) "
+                 "WHERE name = 'ada';"
+                 "SELECT age FROM users;",
+             "sq_update", "1", "");
+  // Statement CTEs are visible inside the subquery: the validator's
+  // subquery scope keeps CTEs and hides FROM relations; codegen matches.
+  CHECK_RUNS(std::string(kSchema) +
+                 "WITH RECURSIVE fib(n, a, b) AS (SELECT 0, 0, 1 "
+                 "UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n < 5) "
+                 "SELECT (SELECT a FROM fib WHERE n = 5);",
+             "sq_cte", "5", "");
+  // Two rows: standard SQL says error -> trap (SIGILL), never a wrong row.
+  CHECK_DIES(std::string(kSchema) +
+                 "INSERT INTO users (id, name) VALUES (1, 'ada'), (2, 'bob');"
+                 "SELECT (SELECT id FROM users);",
+             "sq_multi_row");
+}
+
 TEST(run_empty_program) { CHECK_RUNS("", "empty", "", ""); }
 
 // Column names reach the host: each result set announces itself with an
@@ -729,5 +839,34 @@ TEST(run_column_headers) {
              "2|bob\n"
              "H seven\n"
              "7",
+             "", true);
+}
+
+// The boot tables scan host-filled runtime storage like any other table:
+// the driver installs a fake boot environment, and both star expansion
+// and a typed WHERE over the memory map come back as regular result sets
+// (headers on, so the announced names are covered too).
+TEST(run_boot_tables) {
+  CHECK_COMPILES("SELECT * FROM boot_info; SELECT * FROM memory_map;",
+                 "boot");
+  ++::testing::check_count();
+  check_runs(__FILE__, __LINE__,
+             "SELECT * FROM boot_info;"
+             "SELECT base, length, type FROM memory_map WHERE type = 'usable';"
+             "SELECT base, length FROM memory_map;",
+             "boot_tables",
+             "H hhdm_offset|kernel_phys_base|kernel_virt_base|bootloader|"
+             "bootloader_version|cmdline|firmware|framebuffer_addr|"
+             "framebuffer_width|framebuffer_height|framebuffer_bpp|"
+             "module_count|boot_time\n"
+             "0xffff800000000000|0x100000|0xffffffff81000000|Limine|test|"
+             "/vmlinuz root=/dev/sda1|x86bios|0xfd000000|1024|768|32|1|"
+             "1767225600\n"
+             "H base|length|type\n"
+             "1048576|2146435072|usable\n"
+             "H base|length\n"
+             "0|1048576\n"
+             "1048576|2146435072\n"
+             "4244434944|16777216",
              "", true);
 }

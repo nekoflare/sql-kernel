@@ -20,5 +20,11 @@ WITH RECURSIVE fib(n, a, b) AS (
 SELECT a FROM fib;
 -- fibonacci
 
+-- what the bootloader told us about this machine
+SELECT * FROM boot_info;
+
+-- the memory map Limine handed us
+SELECT base, length, type FROM memory_map;
+
 INSERT INTO io_8_write (port, value) VALUES (233, 69);
 -- E 

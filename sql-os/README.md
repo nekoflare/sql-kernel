@@ -91,7 +91,7 @@ The test binary can also be run directly:
 
 ```sh
 ./build/sqlos_tests
-# OK: 111 tests, 224 checks
+# OK: 116 tests, 244 checks
 ```
 
 ## CLI
@@ -136,9 +136,12 @@ each); these tables are backed by hardware or by fixed memory images:
 | `io_8_write` / `io_16_write` / `io_32_write` | `port INT, value INT` | `INSERT` only | constant `port` in `0..65535`, constant `value` in the width's range (`0..255` / `0..65535` / `0..4294967295`) |
 | `memory` | `address INT, value INT` | `SELECT` / `INSERT` / `UPDATE` | `SELECT`/`UPDATE` need `WHERE address = <expr>` or `address BETWEEN low AND high` (no `DELETE` — use `UPDATE`); literal addresses `>= 0`, literal values `0..255` |
 | `volatile_memory` | same as `memory` | same | same, separate 64 KiB image |
+| `memory_map` | `base INT, length INT, type TEXT` | `SELECT` only | none — a full scan of the host-filled boot memory map (one row per region; `type` is `usable` / `reserved` / `acpi_reclaimable` / `acpi_nvs` / `bad` / `bootloader` / `kernel` / `framebuffer` / `reserved_mapped`) |
+| `boot_info` | `hhdm_offset, kernel_phys_base, kernel_virt_base, bootloader, bootloader_version, cmdline, firmware, framebuffer_addr` (all `TEXT`), `framebuffer_width, framebuffer_height, framebuffer_bpp, module_count, boot_time` (`INT`) | `SELECT` only | none — one row filled by the host at boot. Address columns are `0x`-hex text because upper-half HHDM/kernel addresses don't fit SQL's signed integers; a missing response arrives as `NULL` |
 
 Additional rules, enforced by the validator (they are errors, not
 refusals): `io_*_read` is `SELECT`-only, `io_*_write` is `INSERT`-only,
+`boot_info`/`memory_map` are `SELECT`-only,
 `RETURNING` / `ON CONFLICT` / `INSERT OR ...` are rejected on system
 tables, and `UPDATE memory ... SET address = ...` is rejected.
 
@@ -168,8 +171,11 @@ The code generator currently emits: expressions (arithmetic, comparison,
 table or CTE (with `WHERE`, aliases, qualified stars), `INSERT`, `UPDATE`,
 `DELETE`, `CREATE TABLE` (incl. `AS SELECT`), `DROP`/`ALTER`,
 `CREATE VIEW`/`CREATE INDEX` (tracked in the catalog; no runtime effect),
-`VALUES`, and a single recursive CTE (`WITH RECURSIVE`, anchor
-`UNION ALL` term) compiled to a worklist loop.
+`VALUES`, a single recursive CTE (`WITH RECURSIVE`, anchor
+`UNION ALL` term) compiled to a worklist loop, and uncorrelated scalar
+subqueries `(SELECT ...)` evaluated inline — NULL when the subquery
+returns no rows, `trap()` when it returns more than one (the standard SQL
+error, through the project's defined-failure channel).
 
 Everything else **validates but is refused at codegen** with a precise
 message — never silently compiled wrong, never partially written. The
@@ -188,7 +194,6 @@ not yet compiled: LIMIT
 not yet compiled: OFFSET
 not yet compiled: set operation UNION
 not yet compiled: window function
-not yet compiled: subquery in expression
 not yet compiled: EXISTS
 not yet compiled: IN (subquery)
 not yet compiled: subquery in FROM
@@ -250,17 +255,21 @@ timeout 45 qemu-system-x86_64 -M q35 -m 2G -cdrom ../limine-e9/template-x86_64.i
     -device isa-debugcon,chardev=e9 -chardev file,id=e9,path=e9.log
 cat e9.log
 # WELCOME TO SQL-OS VIA PORT E9   <- staged in RAM, patched by UPDATE, streamed to 0xE9
-# address|value                   <- column names arrive before each
-# -------------                      result set's rows (HeaderFn callback)
-# 4|79 / 5|77 / 6|69 / 7|32
-# a / -                           <- recursive fib CTE, same sink
-# 0 1 1 2 3 5 8 13 21 34 55
+# address | value / a / ...       <- each result set prints centered, padded
+# 4 | 79 ... 0 1 1 ... 55            with " | " gaps and bars that line up
+# hhdm_offset|kernel_phys_base|... <- the boot table: HHDM, kernel bases, ...
+# base|length|type (20 regions)    <- the Limine memory map as a table
+# E                               <- final byte, no newline
 ```
 
 The generated translation unit is compiled with the kernel's freestanding
 flags except `-mno-sse`/`-mno-80387` (the value model has doubles, which the
 SysV ABI returns in `xmm`); `kmain()` enables SSE in hardware before first
-use. See `../limine-e9/README.md` for details.
+use. Before the program runs, `kmain()` also copies the Limine responses
+into the `boot_info` / `memory_map` built-in tables, so SQL can `SELECT`
+the HHDM offset, kernel bases, framebuffer, bootloader info and the whole
+memory map like any other table.
+See `../limine-e9/README.md` for details.
 
 ## Tests
 
@@ -306,9 +315,10 @@ sql-os/
 
 ## Status
 
-Validator and codegen v1 are complete and tested (111 tests, 224 checks),
+Validator and codegen v1 are complete and tested (116 tests, 244 checks),
 and the whole pipeline boots: `../limine-e9/` compiles an SQL program into
 a Limine kernel that writes port 0xE9 on real (emulated) hardware.
 Next steps on the compiler side: joins and aggregation, `ORDER BY`/
-`LIMIT`, richer subquery support, and `RETURNING` — each one moves from
+`LIMIT`, correlated subqueries (`EXISTS` / `IN (SELECT ...)` still
+refuse), and `RETURNING` — each one moves from
 `not yet compiled:` to codegen coverage behind this same test contract.

@@ -32,6 +32,81 @@ volatile std::uint64_t limine_requests_end_marker[] = LIMINE_REQUESTS_END_MARKER
 
 }
 
+// --- Limine boot requests ----------------------------------------------------
+//
+// The bootloader fills the responses below; init_boot_tables() copies them
+// into the SQL boot tables (memory_map, boot_info) before the program runs.
+// Volatile so the compiler actually reads what the bootloader wrote.
+
+namespace {
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_bootloader_info_request bootloader_info_request = {
+    .id = LIMINE_BOOTLOADER_INFO_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_executable_cmdline_request cmdline_request = {
+    .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_firmware_type_request firmware_type_request = {
+    .id = LIMINE_FIRMWARE_TYPE_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_executable_address_request executable_address_request = {
+    .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_framebuffer_request framebuffer_request = {
+    .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+    .internal_module_count = 0,
+    .internal_modules = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_date_at_boot_request date_at_boot_request = {
+    .id = LIMINE_DATE_AT_BOOT_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+}
+
 // Halt and catch fire function, defined below.
 namespace {
 
@@ -184,22 +259,23 @@ void flush_table() {
             const CellView cv = cell_view(table.rows[r][i], buf);
             if (cv.n > w) w = cv.n;
         }
-        table.width[i] = w;
+        table.width[i] = w + 2;  // one space of air per side, so even the
+                                 // longest value keeps a left pad
     }
     for (sqlos::u32 i = 0; i < table.ncols; ++i) {
-        if (i != 0) e9_putc('|');
+        if (i != 0) { e9_putc(' '); e9_putc('|'); e9_putc(' '); }
         sqlos::u32 n = 0;
         while (table.names[i][n] != '\0') ++n;
         put_centered(table.names[i], n, table.width[i]);
     }
     e9_putc('\n');
-    sqlos::u32 total = table.ncols - 1;
+    sqlos::u32 total = 3 * (table.ncols - 1);
     for (sqlos::u32 i = 0; i < table.ncols; ++i) total += table.width[i];
     for (sqlos::u32 k = 0; k < total; ++k) e9_putc('-');
     e9_putc('\n');
     for (sqlos::u32 r = 0; r < table.nrows; ++r) {
         for (sqlos::u32 i = 0; i < table.ncols; ++i) {
-            if (i != 0) e9_putc('|');
+            if (i != 0) { e9_putc(' '); e9_putc('|'); e9_putc(' '); }
             const CellView cv = cell_view(table.rows[r][i], buf);
             put_centered(cv.p, cv.n, table.width[i]);
         }
@@ -218,12 +294,12 @@ void print_header(void *, const char *const *cols, sqlos::u32 ncols) {
 }
 
 // sqlos::SinkFn: buffer the row (or print it plainly when no header was
-// announced for it).
+// announced for it). Columns are always separated by " | ".
 void print_row(void *, const sqlos::Row *row) {
     if (!table.active) {
         char buf[24];
         for (sqlos::u32 i = 0; i < row->count; ++i) {
-            if (i != 0) e9_putc('|');
+            if (i != 0) { e9_putc(' '); e9_putc('|'); e9_putc(' '); }
             const CellView cv = cell_view(row->cells[i], buf);
             put_bytes(cv.p, cv.n);
         }
@@ -237,6 +313,143 @@ void print_row(void *, const sqlos::Row *row) {
         table.rows[table.nrows][i] = sqlos::Value::null();
     }
     ++table.nrows;
+}
+
+}
+
+// --- boot tables -------------------------------------------------------------
+//
+// The Limine responses above become the SQL `memory_map` (one row per
+// entry) and `boot_info` (one row) tables. Both are read-only to SQL.
+// Address columns are TEXT hex because upper-half HHDM/kernel addresses
+// do not fit SQL's signed integers; lengths, dimensions and counts stay
+// INT so they can be computed with. Values keep pointers, so every text
+// they hold is either a literal, bootloader-owned memory, or one of the
+// static buffers below.
+
+namespace {
+
+const char* map_type_name(std::uint64_t type) {
+    switch (type) {
+        case LIMINE_MEMMAP_USABLE: return "usable";
+        case LIMINE_MEMMAP_RESERVED: return "reserved";
+        case LIMINE_MEMMAP_ACPI_RECLAIMABLE: return "acpi_reclaimable";
+        case LIMINE_MEMMAP_ACPI_NVS: return "acpi_nvs";
+        case LIMINE_MEMMAP_BAD_MEMORY: return "bad";
+        case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE: return "bootloader";
+        case LIMINE_MEMMAP_EXECUTABLE_AND_MODULES: return "kernel";
+        case LIMINE_MEMMAP_FRAMEBUFFER: return "framebuffer";
+        case LIMINE_MEMMAP_RESERVED_MAPPED: return "reserved_mapped";
+        default: return "unknown";
+    }
+}
+
+const char* firmware_name(std::uint64_t type) {
+    switch (type) {
+        case LIMINE_FIRMWARE_TYPE_X86BIOS: return "x86bios";
+        case LIMINE_FIRMWARE_TYPE_EFI32: return "efi32";
+        case LIMINE_FIRMWARE_TYPE_EFI64: return "efi64";
+        case LIMINE_FIRMWARE_TYPE_SBI: return "sbi";
+        default: return "unknown";
+    }
+}
+
+sqlos::u32 cstr_len(const char* s) {
+    sqlos::u32 n = 0;
+    while (s[n] != '\0') ++n;
+    return n;
+}
+
+// "0x" + trimmed lowercase hex (leading zeros dropped, "0" kept for zero).
+// out needs 19 bytes; returns the length written.
+sqlos::u32 fmt_hex(sqlos::u64 v, char* out) {
+    char tmp[16];
+    sqlos::u32 n = 0;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        const sqlos::u32 d = static_cast<sqlos::u32>((v >> shift) & 0xF);
+        if (n == 0 && d == 0 && shift != 0) continue;
+        tmp[n++] = static_cast<char>(d < 10 ? '0' + d : 'a' + (d - 10));
+    }
+    out[0] = '0';
+    out[1] = 'x';
+    for (sqlos::u32 i = 0; i < n; ++i) out[2 + i] = tmp[i];
+    return 2 + n;
+}
+
+// Hex TEXT cells point into these; they must outlive init_boot_tables().
+char g_hex_hhdm[24];
+char g_hex_phys[24];
+char g_hex_virt[24];
+char g_hex_fb[24];
+
+sqlos::Value hex_cell(char* buf, sqlos::u64 v) {
+    return sqlos::Value::t(buf, fmt_hex(v, buf));
+}
+
+void init_boot_tables() {
+    // memory_map: one row per Limine entry, capped by SQLOS_MEMMAP_CAP.
+    if (memmap_request.response != nullptr) {
+        const struct limine_memmap_response* resp = memmap_request.response;
+        for (std::uint64_t i = 0; i < resp->entry_count; ++i) {
+            if (sqlos::g_memory_map.count >= SQLOS_MEMMAP_CAP) break;
+            const struct limine_memmap_entry* e = resp->entries[i];
+            if (e == nullptr) continue;
+            const sqlos::u32 row = sqlos::g_memory_map.count;
+            sqlos::g_memory_map.c0[row] =
+                sqlos::Value::i(static_cast<sqlos::i64>(e->base));
+            sqlos::g_memory_map.c1[row] =
+                sqlos::Value::i(static_cast<sqlos::i64>(e->length));
+            const char* type = map_type_name(e->type);
+            sqlos::g_memory_map.c2[row] = sqlos::Value::t(type, cstr_len(type));
+            ++sqlos::g_memory_map.count;
+        }
+    }
+
+    // boot_info: always one row; an absent response arrives as NULL.
+    sqlos::BootInfoStore& b = sqlos::g_boot_info;
+    b.count = 1;
+    if (hhdm_request.response != nullptr) {
+        b.c0[0] = hex_cell(g_hex_hhdm, hhdm_request.response->offset);
+    }
+    if (executable_address_request.response != nullptr) {
+        b.c1[0] = hex_cell(g_hex_phys,
+                           executable_address_request.response->physical_base);
+        b.c2[0] = hex_cell(g_hex_virt,
+                           executable_address_request.response->virtual_base);
+    }
+    if (bootloader_info_request.response != nullptr) {
+        const char* name = bootloader_info_request.response->name;
+        if (name != nullptr) b.c3[0] = sqlos::Value::t(name, cstr_len(name));
+        const char* ver = bootloader_info_request.response->version;
+        if (ver != nullptr) b.c4[0] = sqlos::Value::t(ver, cstr_len(ver));
+    }
+    if (cmdline_request.response != nullptr &&
+        cmdline_request.response->cmdline != nullptr) {
+        const char* cl = cmdline_request.response->cmdline;
+        b.c5[0] = sqlos::Value::t(cl, cstr_len(cl));
+    }
+    if (firmware_type_request.response != nullptr) {
+        const char* fw = firmware_name(firmware_type_request.response->firmware_type);
+        b.c6[0] = sqlos::Value::t(fw, cstr_len(fw));
+    }
+    if (framebuffer_request.response != nullptr &&
+        framebuffer_request.response->framebuffer_count > 0 &&
+        framebuffer_request.response->framebuffers[0] != nullptr) {
+        const struct limine_framebuffer* fb =
+            framebuffer_request.response->framebuffers[0];
+        b.c7[0] = hex_cell(g_hex_fb, reinterpret_cast<sqlos::u64>(fb->address));
+        b.c8[0] = sqlos::Value::i(static_cast<sqlos::i64>(fb->width));
+        b.c9[0] = sqlos::Value::i(static_cast<sqlos::i64>(fb->height));
+        b.c10[0] = sqlos::Value::i(static_cast<sqlos::i64>(fb->bpp));
+    }
+    if (module_request.response != nullptr) {
+        b.c11[0] = sqlos::Value::i(
+            static_cast<sqlos::i64>(module_request.response->module_count));
+    }
+    if (date_at_boot_request.response != nullptr) {
+        b.c12[0] = sqlos::Value::i(
+            static_cast<sqlos::i64>(date_at_boot_request.response->timestamp));
+    }
 }
 
 }
@@ -258,10 +471,12 @@ extern "C" void kmain() {
         __init_array[i]();
     }
 
-    // Run the program that `sqlos --emit` produced from src/sql/program.sql.
-    // Its `INSERT INTO io_8_write (port, value)` rows do real outb to 0xE9;
-    // each result set's column names go to print_header, and every row it
-    // SELECTs is handed to print_row.
+    // Fill the SQL boot tables (memory_map, boot_info) from the Limine
+    // responses, then run the program that `sqlos --emit` produced from
+    // src/sql/program.sql. Its `INSERT INTO io_8_write (port, value)` rows
+    // do real outb to 0xE9; each result set's column names go to
+    // print_header, and every row it SELECTs is handed to print_row.
+    init_boot_tables();
     sqlos_program(print_row, print_header, nullptr);
 
     // The final result set ends with the program.

@@ -395,6 +395,23 @@ TEST(io_write_is_insert_only) {
                 "'io_8_write' accepts INSERT only");
 }
 
+TEST(boot_tables_are_select_only) {
+  CHECK_VALID("SELECT * FROM boot_info");
+  CHECK_VALID("SELECT base, type FROM memory_map WHERE type = 'usable'");
+  CHECK_INVALID("INSERT INTO boot_info (bootloader) VALUES ('x')",
+                "'boot_info' accepts SELECT only");
+  CHECK_INVALID(
+      "INSERT INTO memory_map (base, length, type) VALUES (0, 1, 'usable')",
+      "'memory_map' accepts SELECT only");
+  CHECK_INVALID("UPDATE memory_map SET base = 0 WHERE base = 0",
+                "'memory_map' accepts SELECT only");
+  CHECK_INVALID("UPDATE boot_info SET cmdline = 'x'",
+                "'boot_info' accepts SELECT only");
+  CHECK_INVALID("DELETE FROM boot_info", "'boot_info' accepts SELECT only");
+  CHECK_INVALID("DELETE FROM memory_map WHERE length = 0",
+                "'memory_map' accepts SELECT only");
+}
+
 TEST(memory_reads_and_writes) {
   CHECK_VALID("SELECT value FROM memory WHERE address BETWEEN 0 AND 1023");
   CHECK_VALID("INSERT INTO memory (address, value) VALUES (4096, 65)");

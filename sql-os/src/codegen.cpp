@@ -208,6 +208,7 @@ struct TableCG {
   std::string key;      // lower-case current name
   std::string storage;  // C++ variable (never empty)
   bool view = false;    // views have no storage of their own
+  bool runtime = false;  // storage lives in the runtime header (host-filled)
   int field_count = 0;
   std::vector<ColInfo> columns;
 };
@@ -266,7 +267,17 @@ struct SelectParts {
 class Generator {
  public:
   explicit Generator(const std::vector<SourcePos>& positions)
-      : positions_(positions) {}
+      : positions_(positions) {
+    register_boot_storage("boot_info", "sqlos::g_boot_info",
+                          {"hhdm_offset", "kernel_phys_base",
+                           "kernel_virt_base", "bootloader",
+                           "bootloader_version", "cmdline", "firmware",
+                           "framebuffer_addr", "framebuffer_width",
+                           "framebuffer_height", "framebuffer_bpp",
+                           "module_count", "boot_time"});
+    register_boot_storage("memory_map", "sqlos::g_memory_map",
+                          {"base", "length", "type"});
+  }
 
   CodegenResult run(const std::vector<sql::Statement>& statements);
 
@@ -284,6 +295,9 @@ class Generator {
   std::string make_storage(const std::string& want);
   std::string emit_struct(const std::string& var, int nfields) const;
   const TableCG* cg_for(const std::string& name) const;
+  // Points a system table at its runtime-header store (no struct emitted).
+  void register_boot_storage(const std::string& key, const std::string& var,
+                             const std::vector<std::string>& cols);
 
   // --- statements -----------------------------------------------------------
   std::string gen_statement(const sql::Statement& s);
@@ -301,6 +315,8 @@ class Generator {
                               std::vector<std::string>* out_names = nullptr);
   // Announces a result set's column names to the host sink before its rows.
   std::string announce_header(const std::vector<std::string>& names);
+  // Ends the result set with its statement (HeaderFn, ncols == 0).
+  std::string end_result_set();
   SelectParts plan_select(const sql::SelectStatement& s, const Scope& outer,
                           const Binding* preset);
   static std::string render(const SelectParts& p, const std::string& sink);
@@ -401,6 +417,21 @@ const TableCG* Generator::cg_for(const std::string& name) const {
   if (it == table_var_.end()) return nullptr;
   const auto sit = storage_.find(it->second);
   return sit == storage_.end() ? nullptr : &sit->second;
+}
+
+void Generator::register_boot_storage(const std::string& key,
+                                      const std::string& var,
+                                      const std::vector<std::string>& cols) {
+  TableCG cg;
+  cg.key = key;
+  cg.storage = var;
+  cg.runtime = true;
+  for (std::size_t i = 0; i < cols.size(); ++i) {
+    cg.columns.push_back({cols[i], static_cast<int>(i)});
+  }
+  cg.field_count = static_cast<int>(cols.size());
+  table_var_[key] = var;
+  storage_[var] = std::move(cg);
 }
 
 // ------------------------------------------------------------ DDL -----------
@@ -647,7 +678,7 @@ std::string Generator::gen_select_stmt(const sql::SelectStatement& s) {
   } else {
     body = gen_select_core(s, Scope{}, "sink", nullptr, &names);
   }
-  return announce_header(names) + body;
+  return announce_header(names) + body + end_result_set();
 }
 
 std::string Generator::announce_header(const std::vector<std::string>& names) {
@@ -667,6 +698,14 @@ std::string Generator::announce_header(const std::vector<std::string>& names) {
        std::to_string(names.size()) + ");\n";
   c += "}\n";
   return c;
+}
+
+std::string Generator::end_result_set() {
+  // Every top-level result set ends with its statement. Hosts buffer rows
+  // to size the columns and print the whole table on this signal; internal
+  // sinks (CTE worklists, INSERT ... SELECT) have no header callback, so
+  // the guard skips them.
+  return "if (sink.hdr != nullptr) sink.hdr(sink.ctx, nullptr, 0);\n";
 }
 
 std::string Generator::gen_select_core(const sql::SelectStatement& s,
@@ -1172,7 +1211,7 @@ std::string Generator::gen_insert(const sql::InsertStatement& s) {
   const Table* t = catalog_.find(s.table);
   if (t == nullptr) internal("unknown table " + q(s.table));
   if (t->kind == TableKind::View) internal("INSERT into view " + q(s.table));
-  if (t->sys == SystemClass::IoRead) {
+  if (t->sys == SystemClass::IoRead || t->sys == SystemClass::Boot) {
     internal(q(t->name) + " accepts SELECT only");
   }
   if (s.default_values && t->system()) {
@@ -1325,7 +1364,8 @@ std::string Generator::gen_update(const sql::UpdateStatement& s) {
   const Table* t = catalog_.find(s.table);
   if (t == nullptr) internal("unknown table " + q(s.table));
   if (t->kind == TableKind::View) internal("UPDATE on view " + q(s.table));
-  if (t->sys == SystemClass::IoRead || t->sys == SystemClass::IoWrite) {
+  if (t->sys == SystemClass::IoRead || t->sys == SystemClass::IoWrite ||
+      t->sys == SystemClass::Boot) {
     internal(q(t->name) + " cannot be updated");
   }
   const std::string rel_key = lower(s.alias.empty() ? s.table : s.alias);
@@ -1806,8 +1846,53 @@ std::string Generator::gen_expr(const sql::Expr& e, const Scope& sc) {
     }
     case K::Exists:
       refuse("EXISTS");
-    case K::Subquery:
-      refuse("subquery in expression");
+    case K::Subquery: {
+      if (e.subquery == nullptr) internal("subquery expression without a query");
+      // Scalar subquery, evaluated inline. The scope mirrors the validator's
+      // subquery_scope: the statement's CTEs, not the enclosing FROM
+      // relations — so this is uncorrelated (correlation is caught as an
+      // unknown column before codegen). Empty result is NULL; a second row
+      // is the standard SQL error, taken through trap() like every other
+      // runtime violation.
+      Scope inner;
+      inner.ctes = sc.ctes;
+      const std::string tag = std::to_string(next_id());
+      const std::string cap = "cap" + tag + "_";
+      const std::string out = "out" + tag + "_";
+      const std::string seen = "seen" + tag + "_";
+      const std::string ctx = "capctx" + tag + "_";
+      std::vector<std::string> names;
+      const std::string core =
+          gen_select_core(*e.subquery, inner, cap, nullptr, &names);
+      if (names.size() != 1) {
+        internal("scalar subquery produces " + std::to_string(names.size()) +
+                 " columns");
+      }
+      std::string code = "([&]() -> sqlos::Value {\n";
+      code += "  sqlos::Value " + out + " = sqlos::Value::null();\n";
+      code += "  bool " + seen + " = false;\n";
+      code += "  struct CapCtx" + tag + "_ {\n";
+      code += "    sqlos::Value* out;\n";
+      code += "    bool* seen;\n";
+      code += "  };\n";
+      code += "  CapCtx" + tag + "_ " + ctx + " = {&" + out + ", &" + seen +
+              "};\n";
+      code += "  sqlos::Sink " + cap + ";\n";
+      code += "  " + cap + ".fn = [](void* c_, const sqlos::Row* r_) {\n";
+      code += "    CapCtx" + tag + "_* cap_ = static_cast<CapCtx" + tag +
+              "_*>(c_);\n";
+      code += "    if (*cap_->seen) sqlos::trap();\n";
+      code += "    *cap_->seen = true;\n";
+      code += "    *cap_->out = r_->count > 0u ? r_->cells[0] : "
+              "sqlos::Value::null();\n";
+      code += "  };\n";
+      code += "  " + cap + ".hdr = nullptr;\n";
+      code += "  " + cap + ".ctx = &" + ctx + ";\n";
+      code += core;
+      code += "  return " + out + ";\n";
+      code += "}())";
+      return code;
+    }
     case K::FunctionCall:
       return gen_call(e, sc);
     case K::Cast: {
@@ -1856,7 +1941,7 @@ std::string Generator::assemble() const {
   out += "namespace {\n\n";
   for (const auto& entry : storage_) {
     const TableCG& cg = entry.second;
-    if (cg.view) continue;
+    if (cg.view || cg.runtime) continue;
     out += emit_struct(cg.storage, cg.field_count);
   }
   for (const auto& wl : worklists_) {

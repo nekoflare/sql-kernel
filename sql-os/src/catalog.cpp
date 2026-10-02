@@ -49,6 +49,42 @@ Table make_memory_table(const std::string& name) {
   return table;
 }
 
+// The boot environment as SQL sees it: one row per Limine memory-map
+// entry. Address columns are TEXT hex — upper-half HHDM/kernel addresses
+// do not fit SQL's signed integers — while lengths stay INT so they
+// compute.
+Table make_memory_map_table() {
+  Table table;
+  table.name = "memory_map";
+  table.sys = SystemClass::Boot;
+  table.columns.push_back({"base", Type::Int});
+  table.columns.push_back({"length", Type::Int});
+  table.columns.push_back({"type", Type::Text});
+  return table;
+}
+
+// Facts about this boot in a single row; a column whose response was
+// absent arrives as NULL.
+Table make_boot_info_table() {
+  Table table;
+  table.name = "boot_info";
+  table.sys = SystemClass::Boot;
+  table.columns.push_back({"hhdm_offset", Type::Text});
+  table.columns.push_back({"kernel_phys_base", Type::Text});
+  table.columns.push_back({"kernel_virt_base", Type::Text});
+  table.columns.push_back({"bootloader", Type::Text});
+  table.columns.push_back({"bootloader_version", Type::Text});
+  table.columns.push_back({"cmdline", Type::Text});
+  table.columns.push_back({"firmware", Type::Text});
+  table.columns.push_back({"framebuffer_addr", Type::Text});
+  table.columns.push_back({"framebuffer_width", Type::Int});
+  table.columns.push_back({"framebuffer_height", Type::Int});
+  table.columns.push_back({"framebuffer_bpp", Type::Int});
+  table.columns.push_back({"module_count", Type::Int});
+  table.columns.push_back({"boot_time", Type::Int});
+  return table;
+}
+
 }  // namespace
 
 // --- types -----------------------------------------------------------------
@@ -169,6 +205,10 @@ Catalog::Catalog() {
   const Table volatile_memory = make_memory_table("volatile_memory");
   tables_.emplace(key(memory.name), memory);
   tables_.emplace(key(volatile_memory.name), volatile_memory);
+  const Table memory_map = make_memory_map_table();
+  const Table boot_info = make_boot_info_table();
+  tables_.emplace(key(memory_map.name), memory_map);
+  tables_.emplace(key(boot_info.name), boot_info);
 }
 
 const Table* Catalog::find(std::string_view name) const {

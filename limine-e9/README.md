@@ -16,15 +16,20 @@ port `0xE9` (233), the QEMU/Bochs debug console.
    (`INSERT INTO io_8_write (port, value) SELECT 233, value FROM memory ...`)
 4. reports memory rows and a recursive CTE (`fib`) to the kernel's row sink
    — each result set's column names arrive first, then its rows
-5. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
+5. dumps the bootloader's data as tables: `SELECT * FROM boot_info` (HHDM
+   offset, kernel bases, framebuffer, bootloader version, boot time) and
+   the full Limine memory map (`SELECT base, length, type FROM memory_map`)
+6. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
 
 `kernel/src/main.cpp` — `kmain()`:
 
 * enables SSE first (see below), runs global constructors
+* fills the SQL boot tables from the Limine responses (`init_boot_tables`)
 * calls `sqlos_program(print_row, print_header, nullptr)`
-* `print_header` prints each result set's column names as a table header
-  (names line + an underline of matching width); `print_row` then formats
-  each reported row (`cell|cell`) to port 0xE9
+* `print_header` opens each result set (column names, then an underline of
+  matching width) and closes it when the statement ends; rows are buffered
+  so every column can be sized to its widest entry and centered — the `|`
+  bars line up — before `print_row` prints the table to port 0xE9
 
 ## How the glue fits together
 
@@ -86,36 +91,66 @@ Expected (verified on a real boot):
 
 ```text
 WELCOME TO SQL-OS VIA PORT E9
-address|value
--------------
-4|79
-5|77
-6|69
-7|32
-a
--
-0
-1
-1
-2
-3
-5
-8
-13
-21
-34
-55
+ address  |  value 
+-------------------
+    4     |   79   
+    5     |   77   
+    6     |   69   
+    7     |   32   
+ a  
+----
+ 0  
+ 1  
+ 1  
+ 2  
+ 3  
+ 5  
+ 8  
+ 13 
+ 21 
+ 34 
+ 55 
+    hhdm_offset      |  kernel_phys_base  |   kernel_virt_base   |  bootloader  |  bootloader_version  |  cmdline  |  firmware  |   framebuffer_addr   |  framebuffer_width  |  framebuffer_height  |  framebuffer_bpp  |  module_count  |  boot_time  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 0xffff800000000000  |     0x7feff000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790930647 
+     base       |    length     |       type       
+---------------------------------------------------
+     4096       |    466944     |    bootloader    
+    471040      |    180224     |      usable      
+    654336      |     1024      |     reserved     
+    983040      |     24576     |     reserved     
+    1007616     |     4096      |  reserved_mapped 
+    1011712     |     36864     |     reserved     
+    1048576     |  2145353728   |      usable      
+  2146402304    |     28672     |    bootloader    
+  2146430976    |    212992     |      kernel      
+  2146643968    |     86016     |    bootloader    
+  2146729984    |     98304     |      usable      
+  2146828288    |    520192     |    bootloader    
+  2147348480    |     4096      |     reserved     
+  2147352576    |     12288     |  reserved_mapped 
+  2147364864    |    118784     |     reserved     
+  2952790016    |   268435456   |     reserved     
+  4244635648    |    4096000    |    framebuffer   
+  4275159040    |     16384     |     reserved     
+  4294705152    |    262144     |     reserved     
+ 1086626725888  |  12884901888  |     reserved     
 E
 ```
 
 The first line is the RAM message — `WELCOME` proves the `UPDATE` landed —
-pushed out byte-by-byte by SQL. Each result set then announces its column
-names (`address|value`, then `a`) with an underline before its rows arrive
-through the kernel sink; `4|79` is the patched memory cell itself, and the
-final eleven rows are the recursive `fib` CTE. The trailing `E` is the
-standalone `INSERT INTO io_8_write ... VALUES (233, 69)` at the end of
-`program.sql` (no newline after it). Bochs writes port 0xE9 to its log
-natively.
+pushed out byte-by-byte by SQL. Every table is printed with centered,
+space-padded cells so the `|` bars line up: the columns are sized to their
+widest entry (header name or cell), and each result set prints when its
+statement ends. `4 | 79` is the patched memory cell itself, `a` holds the
+recursive `fib` CTE, then the two boot tables arrive — `boot_info` (filled
+from the Limine responses: HHDM offset, kernel bases, bootloader
+`Limine 12.9.1`, framebuffer, boot time) and the full 20-entry memory map.
+The trailing `E` is the standalone `INSERT INTO io_8_write ... VALUES
+(233, 69)` at the end of `program.sql` (no newline after it). `boot_time`
+is the machine's clock, so it differs between boots; with this exact QEMU
+command the rest of the capture is stable. Bochs writes port 0xE9 to its
+log natively.
 
 ## Layout
 

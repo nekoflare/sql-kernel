@@ -33,6 +33,12 @@
 #ifndef SQLOS_MAX_COLS
 #define SQLOS_MAX_COLS 64  // max columns in one emitted row
 #endif
+#ifndef SQLOS_MEMMAP_CAP
+#define SQLOS_MEMMAP_CAP 64  // rows in the boot memory_map table
+#endif
+#ifndef SQLOS_BOOT_INFO_ROWS
+#define SQLOS_BOOT_INFO_ROWS 1  // boot_info is a single row
+#endif
 
 namespace sqlos {
 
@@ -121,8 +127,10 @@ struct Row {
 using SinkFn = void (*)(void* ctx, const Row* row);
 // Column names of one result set, announced before any of its rows. The
 // names have static storage — hosts may keep the pointers until the
-// program ends. A host that passes a null HeaderFn to sqlos_program never
-// hears about them.
+// program ends. Each result set then ends with its statement: a final
+// call with ncols == 0 (and cols == null) tells the host to print the
+// buffered table. A host that passes a null HeaderFn to sqlos_program
+// never hears about either.
 using HeaderFn = void (*)(void* ctx, const char* const* cols, u32 ncols);
 struct Sink {
   SinkFn fn;
@@ -167,6 +175,39 @@ inline void copy_text(char* dst, const char* src, u32 n) {
 
 inline u8 g_memory[SQLOS_MEM_BYTES] = {};
 inline u8 g_volatile_memory[SQLOS_MEM_BYTES] = {};
+
+// --- boot tables ------------------------------------------------------------
+
+// Read-only views over the boot environment, filled by the host before
+// sqlos_program() runs (the kernel copies the Limine responses here; the
+// hosted test driver installs a small fake). SQL can select from them but
+// never insert, update or delete. The cN fields mirror the generated
+// storage layout so scans read them like any other table.
+struct MemoryMapStore {
+  u32 count;
+  Value c0[SQLOS_MEMMAP_CAP];  // base (physical address, INT)
+  Value c1[SQLOS_MEMMAP_CAP];  // length (INT)
+  Value c2[SQLOS_MEMMAP_CAP];  // type (TEXT: usable, reserved, ...)
+};
+inline MemoryMapStore g_memory_map = {};
+
+struct BootInfoStore {
+  u32 count;
+  Value c0[SQLOS_BOOT_INFO_ROWS];   // hhdm_offset (TEXT hex)
+  Value c1[SQLOS_BOOT_INFO_ROWS];   // kernel_phys_base (TEXT hex)
+  Value c2[SQLOS_BOOT_INFO_ROWS];   // kernel_virt_base (TEXT hex)
+  Value c3[SQLOS_BOOT_INFO_ROWS];   // bootloader (TEXT)
+  Value c4[SQLOS_BOOT_INFO_ROWS];   // bootloader_version (TEXT)
+  Value c5[SQLOS_BOOT_INFO_ROWS];   // cmdline (TEXT)
+  Value c6[SQLOS_BOOT_INFO_ROWS];   // firmware (TEXT)
+  Value c7[SQLOS_BOOT_INFO_ROWS];   // framebuffer_addr (TEXT hex)
+  Value c8[SQLOS_BOOT_INFO_ROWS];   // framebuffer_width (INT)
+  Value c9[SQLOS_BOOT_INFO_ROWS];   // framebuffer_height (INT)
+  Value c10[SQLOS_BOOT_INFO_ROWS];  // framebuffer_bpp (INT)
+  Value c11[SQLOS_BOOT_INFO_ROWS];  // module_count (INT)
+  Value c12[SQLOS_BOOT_INFO_ROWS];  // boot_time (INT, unix seconds)
+};
+inline BootInfoStore g_boot_info = {};
 
 // --- port I/O ---------------------------------------------------------------
 
