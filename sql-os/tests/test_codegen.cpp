@@ -816,6 +816,81 @@ TEST(run_scalar_subquery) {
              "sq_multi_row");
 }
 
+// --- the v1 page allocator, written entirely as SQL --------------------------
+// State: a bitmap in volatile_memory (bit set = claimed; the image starts
+// zeroed, so pool bytes [32..8191] = frames [256..65535] begin fully free),
+// a one-row `meta` cursor (the next byte that may hold a clear bit), and a
+// `pages` registry of (frame, owner). Claim: insert the registry row from
+// the hinted byte's lowest clear bit, set that bit, advance the cursor when
+// the byte fills. Free: clear the bit and rewind the cursor to the freed
+// byte, so reclaimed frames are handed out again. The bitmap holds the bit
+// MASK (1,2,4..128) while a frame holds the bit INDEX (0..7), so the claim
+// converts mask -> index with a CASE, and free converts back with
+// 1 << (frame % 8). No allocator C++ exists anywhere: every statement is
+// ordinary standard SQL over tables that were already there.
+static std::string alloc_page(const char* owner) {
+  return std::string(
+             "INSERT INTO pages (frame, owner) "
+             "SELECT address * 8 + CASE ((~value) & (value + 1)) "
+             "WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 4 THEN 2 WHEN 8 THEN 3 "
+             "WHEN 16 THEN 4 WHEN 32 THEN 5 WHEN 64 THEN 6 ELSE 7 END, '") +
+         owner +
+         "' FROM volatile_memory "
+         "WHERE address = (SELECT cursor FROM meta WHERE id = 0) "
+         "AND value < 255 AND address <= 8191;"
+         "UPDATE volatile_memory SET value = value | ((~value) & (value + 1)) "
+         "WHERE address = (SELECT cursor FROM meta WHERE id = 0) "
+         "AND value < 255 AND address <= 8191;"
+         "UPDATE meta SET cursor = cursor + 1 WHERE id = 0 AND "
+         "(SELECT value FROM volatile_memory "
+         " WHERE address = (SELECT cursor FROM meta WHERE id = 0)) = 255;";
+}
+
+static std::string free_page(const char* owner) {
+  const std::string own = std::string("'") + owner + "'";
+  return std::string(
+             "UPDATE volatile_memory SET value = value & (255 - (1 << "
+             "((SELECT frame FROM pages WHERE owner = ") +
+         own + ") % 8))) WHERE address = (SELECT frame FROM pages WHERE owner = " +
+         own + ") / 8;"
+              "UPDATE meta SET cursor = CASE WHEN (SELECT frame FROM pages WHERE owner = " +
+         own + ") / 8 < cursor THEN (SELECT frame FROM pages WHERE owner = " +
+         own + ") / 8 ELSE cursor END WHERE id = 0;"
+              "DELETE FROM pages WHERE owner = " +
+         own + ";";
+}
+
+// Claim, free, reuse, and exhaustion — the whole allocator contract in one
+// program. Frames come back in bit order within a byte (256, then 257);
+// after a forced cursor advance a free rewinds the cursor, so the next
+// claim hands the same frame back; with the cursor past the pool the claim
+// matches no rows and the registry stays put.
+TEST(run_page_allocator) {
+  CHECK_RUNS(
+      "CREATE TABLE meta (id INT, cursor INT);"
+      "CREATE TABLE pages (frame INT, owner TEXT);"
+      "INSERT INTO meta (id, cursor) VALUES (0, 32);" +
+          alloc_page("A") + alloc_page("B") +
+          "SELECT frame, owner FROM pages;"
+          "SELECT value FROM volatile_memory WHERE address = 32;"
+          "UPDATE meta SET cursor = 40 WHERE id = 0;" +
+          free_page("A") +
+          "SELECT frame, owner FROM pages;" +
+          alloc_page("C") +
+          "SELECT frame, owner FROM pages;"
+          "SELECT value FROM volatile_memory WHERE address = 32;"
+          "UPDATE meta SET cursor = 8192 WHERE id = 0;" +
+          alloc_page("D") + "SELECT frame, owner FROM pages;",
+      "page_allocator",
+      "256|A\n257|B\n"
+      "3\n"
+      "257|B\n"
+      "257|B\n256|C\n"
+      "3\n"
+      "257|B\n256|C",
+      "");
+}
+
 TEST(run_empty_program) { CHECK_RUNS("", "empty", "", ""); }
 
 // Column names reach the host: each result set announces itself with an

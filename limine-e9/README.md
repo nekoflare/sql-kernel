@@ -19,7 +19,11 @@ port `0xE9` (233), the QEMU/Bochs debug console.
 5. dumps the bootloader's data as tables: `SELECT * FROM boot_info` (HHDM
    offset, kernel bases, framebuffer, bootloader version, boot time) and
    the full Limine memory map (`SELECT base, length, type FROM memory_map`)
-6. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
+6. runs a page allocator written in SQL alone: claims frames 256/257 from
+   the `volatile_memory` bitmap into the `pages` registry (scan cursor in
+   the one-row `meta` table), prints registry + bitmap byte, frees
+   `frame-a` and claims again — frame 256 comes back as `frame-c`
+7. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
 
 `kernel/src/main.cpp` — `kmain()`:
 
@@ -112,7 +116,7 @@ WELCOME TO SQL-OS VIA PORT E9
  55 
     hhdm_offset      |  kernel_phys_base  |   kernel_virt_base   |  bootloader  |  bootloader_version  |  cmdline  |  firmware  |   framebuffer_addr   |  framebuffer_width  |  framebuffer_height  |  framebuffer_bpp  |  module_count  |  boot_time  
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 0xffff800000000000  |     0x7feff000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790930647 
+ 0xffff800000000000  |     0x7feba000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790939189 
      base       |    length     |       type       
 ---------------------------------------------------
      4096       |    466944     |    bootloader    
@@ -121,10 +125,10 @@ WELCOME TO SQL-OS VIA PORT E9
     983040      |     24576     |     reserved     
     1007616     |     4096      |  reserved_mapped 
     1011712     |     36864     |     reserved     
-    1048576     |  2145353728   |      usable      
-  2146402304    |     28672     |    bootloader    
-  2146430976    |    212992     |      kernel      
-  2146643968    |     86016     |    bootloader    
+    1048576     |  2145071104   |      usable      
+  2146119680    |     28672     |    bootloader    
+  2146148352    |    385024     |      kernel      
+  2146533376    |    196608     |    bootloader    
   2146729984    |     98304     |      usable      
   2146828288    |    520192     |    bootloader    
   2147348480    |     4096      |     reserved     
@@ -135,6 +139,20 @@ WELCOME TO SQL-OS VIA PORT E9
   4275159040    |     16384     |     reserved     
   4294705152    |    262144     |     reserved     
  1086626725888  |  12884901888  |     reserved     
+ frame  |   owner  
+-------------------
+  256   |  frame-a 
+  257   |  frame-b 
+ value 
+-------
+   3   
+ frame  |   owner  
+-------------------
+  257   |  frame-b 
+  256   |  frame-c 
+ value 
+-------
+   3   
 E
 ```
 
@@ -146,11 +164,16 @@ statement ends. `4 | 79` is the patched memory cell itself, `a` holds the
 recursive `fib` CTE, then the two boot tables arrive — `boot_info` (filled
 from the Limine responses: HHDM offset, kernel bases, bootloader
 `Limine 12.9.1`, framebuffer, boot time) and the full 20-entry memory map.
-The trailing `E` is the standalone `INSERT INTO io_8_write ... VALUES
-(233, 69)` at the end of `program.sql` (no newline after it). `boot_time`
-is the machine's clock, so it differs between boots; with this exact QEMU
-command the rest of the capture is stable. Bochs writes port 0xE9 to its
-log natively.
+Then the page-allocator result sets arrive: `pages` shows frames 256 and
+257 handed out, the `value` row is bitmap byte 32 (`3` = both bits set),
+and after `frame-a` is freed the next claim brings frame 256 back as
+`frame-c` — allocation, free and reuse with no allocator C++, plain SQL
+over `volatile_memory`. The trailing `E` is the standalone
+`INSERT INTO io_8_write ... VALUES (233, 69)` at the end of
+`program.sql` (no newline after it). `boot_time`, the kernel's placement
+and the memory map's split points come from the boot itself, so they
+differ between runs; with this exact QEMU command the allocator tables
+are stable. Bochs writes port 0xE9 to its log natively.
 
 ## Layout
 

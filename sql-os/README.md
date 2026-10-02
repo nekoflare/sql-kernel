@@ -91,7 +91,7 @@ The test binary can also be run directly:
 
 ```sh
 ./build/sqlos_tests
-# OK: 116 tests, 244 checks
+# OK: 117 tests, 245 checks
 ```
 
 ## CLI
@@ -216,6 +216,34 @@ not yet compiled: memory tables support only WHERE address = <expr> or address B
 Refusals are reported at the offending statement's position
 (`error: line L:C: not yet compiled: ...`) and the exit code is 1.
 
+## A page allocator in pure SQL
+
+Everything above composes into a working frame allocator with **zero
+allocator C++**: state lives in tables that already existed, and claim/free
+are ordinary SQL statements (see `../limine-e9/kernel/src/sql/program.sql`
+for the boot demo, `tests/test_codegen.cpp` for the round-trip test).
+
+* **Bitmap** — `volatile_memory`, one bit per 4 KiB frame, bit set =
+  claimed. The 64 KiB image starts zeroed, so pool bytes `32..8191`
+  (frames `256..65535`, 1 MiB..256 MiB of `usable` RAM) begin fully free.
+* **Cursor** — a one-row `meta (id, cursor)` table: the next byte that may
+  hold a clear bit. Advanced with a plain `SET cursor = cursor + 1` once
+  the byte is full, rewound on free so reclaimed frames are reused.
+* **Registry** — a user table `pages (frame, owner)` records who holds
+  what.
+
+A claim is three statements: insert the registry row computed from the
+hinted byte's lowest clear bit (`(~value) & (value + 1)` is the mask,
+converted to the 0..7 index with a `CASE`), set that bit with
+`value | ((~value) & (value + 1))`, then advance the cursor if the byte
+just filled. A free reverses it: clear the bit
+(`value & (255 - (1 << (frame % 8)))`), rewind the cursor to the freed
+byte, delete the registry row. The pool end (`address <= 8191`) is part
+of the claim's `WHERE`, so an exhausted pool matches no rows instead of
+handing out memory past the end. Every address comes from a scalar
+subquery over the cursor, which is what the `(SELECT ...)` feature above
+made possible.
+
 ## The runtime
 
 Generated code includes exactly one header,
@@ -259,6 +287,8 @@ cat e9.log
 # 4 | 79 ... 0 1 1 ... 55            with " | " gaps and bars that line up
 # hhdm_offset|kernel_phys_base|... <- the boot table: HHDM, kernel bases, ...
 # base|length|type (20 regions)    <- the Limine memory map as a table
+# 256|frame-a 257|frame-b ...      <- the pure-SQL page allocator: claim,
+#                                     free, reclaim (256 comes back as frame-c)
 # E                               <- final byte, no newline
 ```
 
@@ -285,7 +315,9 @@ See `../limine-e9/README.md` for details.
    CRUD, recursion (anchor/term/`VALUES` anchors/outer `WHERE`), hardware
    I/O (8/16/32-bit ports, both memory images), expressions, `ALTER`
    chains, star forms, simultaneous `UPDATE` assignment, deletion
-   compaction, CTAS and `INSERT ... SELECT`.
+   compaction, CTAS and `INSERT ... SELECT`, scalar subqueries (value,
+   NULL, CTE visibility, multi-row `trap()` via `CHECK_DIES`), and the
+   pure-SQL page allocator round trip (claim, free, reuse, exhaustion).
 
 `tests/test_validate.cpp` covers the validator (catalog, contracts, types,
 recursive-CTE structure, issue positions).
@@ -315,10 +347,11 @@ sql-os/
 
 ## Status
 
-Validator and codegen v1 are complete and tested (116 tests, 244 checks),
+Validator and codegen v1 are complete and tested (117 tests, 245 checks),
 and the whole pipeline boots: `../limine-e9/` compiles an SQL program into
-a Limine kernel that writes port 0xE9 on real (emulated) hardware.
-Next steps on the compiler side: joins and aggregation, `ORDER BY`/
-`LIMIT`, correlated subqueries (`EXISTS` / `IN (SELECT ...)` still
-refuse), and `RETURNING` — each one moves from
-`not yet compiled:` to codegen coverage behind this same test contract.
+a Limine kernel that writes port 0xE9 on real (emulated) hardware — boot
+tables and the pure-SQL page allocator included. Next steps on the
+compiler side: joins and aggregation, `ORDER BY`/`LIMIT`, correlated
+subqueries (`EXISTS` / `IN (SELECT ...)` still refuse), and `RETURNING` —
+each one moves from `not yet compiled:` to codegen coverage behind this
+same test contract.
