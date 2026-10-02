@@ -1,0 +1,6 @@
+# Debug-port captures (see the boot sections of the READMEs)
+e9.log
+
+# Generated from program.sql by `sqlos --emit`
+# (make -C limine-e9 regenerates it from the SQL source)
+limine-e9/kernel/src/sql/program.cpp
