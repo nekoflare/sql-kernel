@@ -960,6 +960,77 @@ TEST(run_virt_mapping) {
       "");
 }
 
+// The whole protocol as one program: read the live root from
+// boot_info.cr3, claim frames from the SQL allocator, write a subtree slot
+// in the live PML4 *guarded* by the slot being zero, link pdpt -> pd -> pt
+// -> data (indices 1, 2, 3, 4 of virtual address 1*2^39 + 2*2^30 +
+// 3*2^21 + 4*2^12 + 5), activate through cr3_write, then read and write
+// through virt_memory and finally re-point the PTE at a sixth frame —
+// after the flush the same virtual address translates to the new frame
+// and the old frame keeps its byte. Every address is computed from the
+// allocator registry; nothing but access code lives in C++.
+TEST(run_virt_protocol) {
+  const std::string va = "551909605381";  // indices (1, 2, 3, 4), offset 5
+  CHECK_RUNS(
+      "CREATE TABLE meta (id INT, cursor INT);"
+      "CREATE TABLE pages (frame INT, owner TEXT);"
+      "INSERT INTO meta (id, cursor) VALUES (0, 32);" +
+          alloc_page("pdpt") + alloc_page("pd") + alloc_page("pt") +
+          alloc_page("data") +
+          // guarded slot: only link when live PML4 slot 1 is zero
+          "INSERT INTO phys (address, value) "
+          "SELECT (SELECT cr3 FROM boot_info) + 8, frame * 4096 + 3 "
+          "FROM pages WHERE owner = 'pdpt' AND (SELECT value FROM phys "
+          "WHERE address = (SELECT cr3 FROM boot_info) + 8) = 0;"
+          "INSERT INTO phys (address, value) "
+          "SELECT (SELECT frame FROM pages WHERE owner = 'pdpt') * 4096 + 16,"
+          " frame * 4096 + 3 FROM pages WHERE owner = 'pd';"
+          "INSERT INTO phys (address, value) "
+          "SELECT (SELECT frame FROM pages WHERE owner = 'pd') * 4096 + 24,"
+          " frame * 4096 + 3 FROM pages WHERE owner = 'pt';"
+          "INSERT INTO phys (address, value) "
+          "SELECT (SELECT frame FROM pages WHERE owner = 'pt') * 4096 + 32,"
+          " frame * 4096 + 3 FROM pages WHERE owner = 'data';"
+          "INSERT INTO cr3_write (value) SELECT cr3 FROM boot_info;"
+          "INSERT INTO virt_memory (address, value) VALUES (" +
+          va + ", 77);"
+               "SELECT value FROM virt_memory WHERE address = " + va + ";"
+               "SELECT value FROM phys WHERE address = "
+               "(SELECT frame FROM pages WHERE owner = 'data') * 4096;" +
+          alloc_page("data2") +
+          "UPDATE phys SET value = (SELECT frame FROM pages "
+          "WHERE owner = 'data2') * 4096 + 3 "
+          "WHERE address = (SELECT frame FROM pages WHERE owner = 'pt') "
+          "* 4096 + 32;"
+          "INSERT INTO cr3_write (value) SELECT cr3 FROM boot_info;"
+          "SELECT value FROM virt_memory WHERE address = " +
+          va + ";"
+               "INSERT INTO virt_memory (address, value) VALUES (" +
+          va + ", 88);"
+               "SELECT value FROM virt_memory WHERE address = " + va + ";"
+               "SELECT value FROM phys WHERE address = "
+               "(SELECT frame FROM pages WHERE owner = 'data2') * 4096;"
+               "SELECT value FROM phys WHERE address = "
+               "(SELECT frame FROM pages WHERE owner = 'data') * 4096;"
+               "SELECT frame, owner FROM pages;"
+               "SELECT value FROM volatile_memory WHERE address = 32;",
+      "virt_protocol",
+      "77\n"
+      "84662395338752\n"
+      "0\n"
+      "88\n"
+      "96757023244288\n"
+      "84662395338752\n"
+      "256|pdpt\n"
+      "257|pd\n"
+      "258|pt\n"
+      "259|data\n"
+      "260|data2\n"
+      "31\n"
+      "CR3 4096 (x2)",
+      "");
+}
+
 // Contract violations that validation cannot see trap at run time: a phys
 // address past the hosted window, and virtual addresses whose tables were
 // never built (the seeded PML4 is zeroed, so nothing is present).

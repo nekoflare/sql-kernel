@@ -91,7 +91,7 @@ The test binary can also be run directly:
 
 ```sh
 ./build/sqlos_tests
-# OK: 123 tests, 277 checks
+# OK: 124 tests, 278 checks
 ```
 
 ## CLI
@@ -251,6 +251,36 @@ handing out memory past the end. Every address comes from a scalar
 subquery over the cursor, which is what the `(SELECT ...)` feature above
 made possible.
 
+## Virtual memory in pure SQL
+
+Same rule as the allocator: the hardware-access layer is C++, every
+mapping and translation decision is SQL.
+
+* **`phys`** is a qword window onto RAM — `address` is an 8-aligned byte
+  address, `value` the 64-bit word there. The kernel reaches RAM through
+  the Limine HHDM (`g_hhdm`); hosted simulates a 2 MiB window. SQL writes
+  page-table entries as words, like any other value.
+* **`cr3_write`** activates a root: `INSERT INTO cr3_write (value) SELECT
+  cr3 FROM boot_info;` reloads CR3 (kernel: the real instruction, which
+  flushes the TLB; hosted: recorded for the tests, like port writes).
+* **`virt_memory`** is byte access at a *virtual* address. In the kernel
+  it is a bare dereference — the CPU walks the tables SQL built; no walk
+  code exists in C++. Hosted has no MMU, so it emulates the 4-level walk
+  (present/writable, 4 KiB pages) as a test hook, the role `inb`/`outb`
+  play for ports.
+
+The boot demo (`../limine-e9/kernel/src/sql/program.sql`) and
+`run_virt_protocol` in the tests run the same protocol as ordinary
+statements: read the live root from `boot_info.cr3`, claim frames from
+the allocator, write a PML4 slot *guarded* by its word still being zero,
+link `root[1] -> pdpt -> pd[3] -> pt[4] -> data`, activate with
+`cr3_write`, then write a byte through `virt_memory` and read it back
+both through the mapping and through the data frame's word. Re-pointing
+the PTE and re-flushing moves the same virtual address to a new frame
+while the old frame keeps its byte. Refusals keep the surface small:
+`phys` has no `BETWEEN` form (its rows are words, a range has no
+stepping), so `WHERE address = <expr>` is all it accepts.
+
 ## The runtime
 
 Generated code includes exactly one header,
@@ -296,6 +326,9 @@ cat e9.log
 # base|length|type (20 regions)    <- the Limine memory map as a table
 # 256|frame-a 257|frame-b ...      <- the pure-SQL page allocator: claim,
 #                                     free, reclaim (256 comes back as frame-c)
+# cr3 / slot 0 / 77 / 84662395338752 <- virtual memory in SQL: extend the
+#                                     live PML4 through phys, activate with
+#                                     cr3_write, read/write via virt_memory
 # E                               <- final byte, no newline
 ```
 
@@ -305,7 +338,8 @@ SysV ABI returns in `xmm`); `kmain()` enables SSE in hardware before first
 use. Before the program runs, `kmain()` also copies the Limine responses
 into the `boot_info` / `memory_map` built-in tables, so SQL can `SELECT`
 the HHDM offset, kernel bases, framebuffer, bootloader info and the whole
-memory map like any other table.
+memory map like any other table — plus `cr3`, the page-table root the
+demo extends into working mappings entirely from SQL.
 See `../limine-e9/README.md` for details.
 
 ## Tests
@@ -328,7 +362,10 @@ See `../limine-e9/README.md` for details.
    and virtual memory (qword `phys` writes, `cr3_write` activation, one
    4-level mapping built from raw `phys` words and then read, written and
    read back through `virt_memory`, with unmapped/out-of-window accesses
-   `trap()`-covered via `CHECK_DIES`).
+   `trap()`-covered via `CHECK_DIES`), and `run_virt_protocol` — the
+   whole protocol round trip: live root from `boot_info.cr3`, allocator
+   frames, guarded slot link, then the PTE re-pointed at a sixth frame
+   and re-flushed.
 
 `tests/test_validate.cpp` covers the validator (catalog, contracts, types,
 recursive-CTE structure, issue positions).
@@ -358,10 +395,11 @@ sql-os/
 
 ## Status
 
-Validator and codegen v1 are complete and tested (123 tests, 277 checks),
+Validator and codegen v1 are complete and tested (124 tests, 278 checks),
 and the whole pipeline boots: `../limine-e9/` compiles an SQL program into
 a Limine kernel that writes port 0xE9 on real (emulated) hardware — boot
-tables and the pure-SQL page allocator included. Next steps on the
+tables, the pure-SQL page allocator, and virtual memory (SQL writes the
+page tables, the CPU walks them) included. Next steps on the
 compiler side: joins and aggregation, `ORDER BY`/`LIMIT`, correlated
 subqueries (`EXISTS` / `IN (SELECT ...)` still refuse), and `RETURNING` —
 each one moves from `not yet compiled:` to codegen coverage behind this

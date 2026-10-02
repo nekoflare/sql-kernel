@@ -24,7 +24,14 @@ port `0xE9` (233), the QEMU/Bochs debug console.
    the `volatile_memory` bitmap into the `pages` registry (scan cursor in
    the one-row `meta` table), prints registry + bitmap byte, frees
    `frame-a` and claims again — frame 256 comes back as `frame-c`
-7. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
+7. builds virtual memory in SQL: prints `boot_info.cr3` (the live root)
+   and the zero word at its slot 1, claims four more frames for
+   `pdpt`/`pd`/`pt`/`data`, links `root[1] -> pdpt -> pd[3] -> pt[4] ->
+   data` through guarded `phys` writes, activates the tables with
+   `INSERT INTO cr3_write`, then writes `77` through a virtual address
+   and reads it back through `virt_memory` and through the data frame's
+   word — no page-walking code exists in C++, the CPU does it
+8. writes one more byte straight to the port (`VALUES (233, 69)` → `E`)
 
 `kernel/src/main.cpp` — `kmain()`:
 
@@ -119,7 +126,7 @@ WELCOME TO SQL-OS VIA PORT E9
  55 
     hhdm_offset      |  kernel_phys_base  |   kernel_virt_base   |  bootloader  |  bootloader_version  |  cmdline  |  firmware  |   framebuffer_addr   |  framebuffer_width  |  framebuffer_height  |  framebuffer_bpp  |  module_count  |  boot_time   |     cr3     
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 0xffff800000000000  |     0x7feba000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790944007  |  2146934784 
+ 0xffff800000000000  |     0x7fe8c000     |  0xffffffff80000000  |    Limine    |        12.9.1        |           |  x86bios   |  0xffff8000fd000000  |        1280         |         800          |        32         |       -        |  1790945145  |  2146934784 
      base       |    length     |       type       
 ---------------------------------------------------
      4096       |    466944     |    bootloader    
@@ -128,10 +135,10 @@ WELCOME TO SQL-OS VIA PORT E9
     983040      |     24576     |     reserved     
     1007616     |     4096      |  reserved_mapped 
     1011712     |     36864     |     reserved     
-    1048576     |  2145071104   |      usable      
-  2146119680    |     28672     |    bootloader    
-  2146148352    |    385024     |      kernel      
-  2146533376    |    196608     |    bootloader    
+    1048576     |  2144882688   |      usable      
+  2145931264    |     28672     |    bootloader    
+  2145959936    |    397312     |      kernel      
+  2146357248    |    372736     |    bootloader    
   2146729984    |     98304     |      usable      
   2146828288    |    520192     |    bootloader    
   2147348480    |     4096      |     reserved     
@@ -156,6 +163,29 @@ WELCOME TO SQL-OS VIA PORT E9
  value 
 -------
    3   
+    cr3     
+------------
+ 2146934784 
+ value 
+-------
+   0   
+ value 
+-------
+  77   
+     value      
+----------------
+ 84662395338752 
+ frame  |   owner  
+-------------------
+  257   |  frame-b 
+  256   |  frame-c 
+  258   |   pdpt   
+  259   |    pd    
+  260   |    pt    
+  261   |   data   
+ value 
+-------
+  63   
 E
 ```
 
@@ -172,12 +202,20 @@ Then the page-allocator result sets arrive: `pages` shows frames 256 and
 257 handed out, the `value` row is bitmap byte 32 (`3` = both bits set),
 and after `frame-a` is freed the next claim brings frame 256 back as
 `frame-c` — allocation, free and reuse with no allocator C++, plain SQL
-over `volatile_memory`. The trailing `E` is the standalone
+over `volatile_memory`. Next comes the virtual-memory block: `cr3` prints
+the live root SQL is about to extend, the first `value` table is slot 1's
+word before the guarded write (`0`, so the guard passes), `77` comes back
+through `virt_memory` — the CPU walked the four entries SQL just wrote —
+and `84662395338752` is that byte seen from the frame's word
+(`77 << 40`, byte 5 of the little-endian qword); the registry now lists
+frames 258–261 as `pdpt`/`pd`/`pt`/`data` and bitmap byte 32 reads `63`
+(all six claims set). The trailing `E` is the standalone
 `INSERT INTO io_8_write ... VALUES (233, 69)` at the end of
-`program.sql` (no newline after it). `boot_time`, the kernel's placement
-and the memory map's split points come from the boot itself, so they
-differ between runs; with this exact QEMU command the allocator tables
-are stable. Bochs writes port 0xE9 to its log natively.
+`program.sql` (no newline after it). `boot_time`, `cr3`, the kernel's
+placement and the memory map's split points come from the boot itself, so
+they differ between runs; with this exact QEMU command the allocator and
+virtual-memory tables are stable. Bochs writes port 0xE9 to its log
+natively.
 
 ## Layout
 
