@@ -26,17 +26,12 @@ SELECT * FROM boot_info;
 -- the memory map Limine handed us
 SELECT base, length, type FROM memory_map;
 
--- a page allocator in pure SQL: there is no allocator C++. The bitmap
--- lives in volatile_memory (bit set = claimed; the image starts zeroed),
--- the scan hint in the one-row meta table, ownership in pages.
--- Pool: bytes 32..8191 = frames 256..65535 (1 MiB..256 MiB).
+-- page allocator 
 CREATE TABLE meta (id INT, cursor INT);
 CREATE TABLE pages (frame INT, owner TEXT);
 INSERT INTO meta (id, cursor) VALUES (0, 32);
 
--- claim frame-a: take the hinted byte's lowest clear bit (1,2,4..128 is
--- the mask in the bitmap, 0..7 the index in the frame number), record it,
--- and move the cursor on once the byte is full
+-- claim frame-a
 INSERT INTO pages (frame, owner)
   SELECT address * 8 + CASE ((~value) & (value + 1))
          WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 4 THEN 2 WHEN 8 THEN 3
@@ -51,7 +46,7 @@ UPDATE meta SET cursor = cursor + 1 WHERE id = 0
   AND (SELECT value FROM volatile_memory
        WHERE address = (SELECT cursor FROM meta WHERE id = 0)) = 255;
 
--- claim frame-b: same three statements, next bit of the same byte
+-- claim frame-b
 INSERT INTO pages (frame, owner)
   SELECT address * 8 + CASE ((~value) & (value + 1))
          WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 4 THEN 2 WHEN 8 THEN 3
@@ -69,7 +64,7 @@ UPDATE meta SET cursor = cursor + 1 WHERE id = 0
 SELECT frame, owner FROM pages;
 SELECT value FROM volatile_memory WHERE address = 32;
 
--- free frame-a: clear its bit and rewind the cursor to the freed byte
+-- free frame-a
 UPDATE volatile_memory
   SET value = value & (255 - (1 << ((SELECT frame FROM pages
        WHERE owner = 'frame-a') % 8)))
@@ -81,7 +76,7 @@ UPDATE meta SET cursor = CASE
   WHERE id = 0;
 DELETE FROM pages WHERE owner = 'frame-a';
 
--- claim frame-c: the freed frame comes back
+-- claim frame-c
 INSERT INTO pages (frame, owner)
   SELECT address * 8 + CASE ((~value) & (value + 1))
          WHEN 1 THEN 0 WHEN 2 THEN 1 WHEN 4 THEN 2 WHEN 8 THEN 3
